@@ -1,3 +1,4 @@
 telethon
-telethon openai python-dotenv
+telethon openai 
+python-dotenv
 cryptg==0.4.0
