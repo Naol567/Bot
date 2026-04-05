@@ -1,19 +1,18 @@
 """
 Forex Group Management Bot
-Powered by Telethon + Gemini AI + SQLite
+Powered by Telethon + Gemini AI + In-Memory warnings
 Deployed on Railway
 """
 
 import os
 import asyncio
-import sqlite3
 import logging
 import json
 import re
 from datetime import datetime
 
 from telethon import TelegramClient, events
-from telethon.tl.functions.channels import BanChatUserRequest
+from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
 import google.generativeai as genai
 
@@ -25,12 +24,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Environment Variables ────────────────────────────────────────────────────
-API_ID       = int(os.environ["API_ID"])
-API_HASH     = os.environ["API_HASH"]
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
-GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
-ADMIN_ID     = int(os.environ["ADMIN_ID"])
-DB_PATH      = os.environ.get("DB_PATH", "/data/group_bot.db")
+API_ID     = int(os.environ["API_ID"])
+API_HASH   = os.environ["API_HASH"]
+BOT_TOKEN  = os.environ["BOT_TOKEN"]
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+ADMIN_ID   = int(os.environ["ADMIN_ID"])
 
 # ─── Gemini Setup ─────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_KEY)
@@ -39,61 +37,29 @@ gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 # ─── Telethon Client ──────────────────────────────────────────────────────────
 client = TelegramClient("bot_session", API_ID, API_HASH)
 
-# ─── Database ─────────────────────────────────────────────────────────────────
-
-def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS warnings (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                full_name   TEXT,
-                warnings    INTEGER DEFAULT 0,
-                last_reason TEXT,
-                updated_at  TEXT
-            )
-        """)
-        conn.commit()
-    log.info("✅ Database ready at %s", DB_PATH)
+# ─── In-Memory Warning Store ──────────────────────────────────────────────────
+# { user_id: { "count": int, "username": str, "full_name": str, "last_reason": str } }
+warnings_db: dict = {}
 
 
 def get_warning_count(user_id: int) -> int:
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT warnings FROM warnings WHERE user_id = ?", (user_id,)
-        ).fetchone()
-    return row["warnings"] if row else 0
+    return warnings_db.get(user_id, {}).get("count", 0)
 
 
 def record_violation(user_id: int, username: str, full_name: str, reason: str):
-    now = datetime.utcnow().isoformat()
-    with get_db() as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM warnings WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        if exists:
-            conn.execute(
-                """UPDATE warnings
-                   SET warnings = warnings + 1,
-                       username = ?, full_name = ?, last_reason = ?, updated_at = ?
-                   WHERE user_id = ?""",
-                (username, full_name, reason, now, user_id),
-            )
-        else:
-            conn.execute(
-                """INSERT INTO warnings
-                   (user_id, username, full_name, warnings, last_reason, updated_at)
-                   VALUES (?, ?, ?, 1, ?, ?)""",
-                (user_id, username, full_name, reason, now),
-            )
-        conn.commit()
+    if user_id in warnings_db:
+        warnings_db[user_id]["count"] += 1
+        warnings_db[user_id]["username"] = username
+        warnings_db[user_id]["full_name"] = full_name
+        warnings_db[user_id]["last_reason"] = reason
+    else:
+        warnings_db[user_id] = {
+            "count": 1,
+            "username": username,
+            "full_name": full_name,
+            "last_reason": reason,
+        }
+    log.info("📋 warnings_db updated: user %s → count %s", user_id, warnings_db[user_id]["count"])
 
 # ─── Gemini Analysis ──────────────────────────────────────────────────────────
 
@@ -146,7 +112,6 @@ THIS IS A FOREX TRADING GROUP — understand the context before judging.
 JUDGMENT GUIDELINES:
 - When in doubt → ALWAYS choose ALLOWED. A missed scam is better than banning a real trader.
 - "Paid signals" mentioned in discussion or criticism → ALLOWED
-- Sharing a personal broker referral in genuine context → ALLOWED (only flag if clearly spamming)
 - Strong opinions, arguments, debates about trading → ALLOWED
 - A long message that mixes trading content with one promotional line → judge by DOMINANT intent
 ════════════════════════════════════════════
@@ -159,6 +124,10 @@ Respond ONLY with valid JSON. No markdown. No explanation outside the JSON:
 
 
 async def analyse_message(text: str) -> dict:
+    """
+    Sends message to Gemini for full contextual analysis.
+    Fails SAFE → ALLOWED on any error.
+    """
     try:
         full_prompt = f"{SYSTEM_PROMPT}\n\nMessage to analyse:\n---\n{text[:2000]}\n---"
         response = await asyncio.to_thread(
@@ -174,10 +143,10 @@ async def analyse_message(text: str) -> dict:
         log.info("🔍 Gemini → %s | %s", verdict, reason)
         return {"verdict": verdict, "reason": reason}
     except json.JSONDecodeError:
-        log.warning("⚠️ Gemini returned invalid JSON — defaulting to ALLOWED")
+        log.warning("⚠️ Gemini invalid JSON — defaulting ALLOWED")
         return {"verdict": "ALLOWED", "reason": "Parse error — safe default."}
     except Exception as exc:
-        log.warning("⚠️ Gemini error: %s — defaulting to ALLOWED", exc)
+        log.warning("⚠️ Gemini error: %s — defaulting ALLOWED", exc)
         return {"verdict": "ALLOWED", "reason": "API error — safe default."}
 
 # ─── Moderation Actions ───────────────────────────────────────────────────────
@@ -192,11 +161,14 @@ async def delete_message(chat_id: int, message_id: int):
 
 async def ban_user(chat_id: int, user_id: int):
     try:
-        rights = ChatBannedRights(until_date=None, view_messages=True)
-        await client(BanChatUserRequest(
+        # EditBannedRequest is the correct Telethon method for banning
+        await client(EditBannedRequest(
             channel=chat_id,
-            user_id=user_id,
-            banned_rights=rights,
+            participant=user_id,
+            banned_rights=ChatBannedRights(
+                until_date=None,   # permanent
+                view_messages=True
+            )
         ))
         log.info("🔨 Banned user %s", user_id)
     except Exception as exc:
@@ -223,6 +195,7 @@ async def notify_admin(
     reason: str,
     action: str,
 ):
+    """Sends private report to admin only — nothing posted in the group."""
     try:
         tag = f"@{username}" if username else f"ID:{user_id}"
         report = (
@@ -244,16 +217,19 @@ async def notify_admin(
 
 @client.on(events.NewMessage)
 async def handle_message(event):
+    # Only watch group/channel messages
     if not event.is_group and not event.is_channel:
         return
     if event.out:
         return
+
     sender = await event.get_sender()
     if sender is None or getattr(sender, "bot", False):
         return
+
     message_text = event.raw_text or ""
     if not message_text.strip():
-        return
+        return  # skip pure media with no caption
 
     user_id   = sender.id
     username  = getattr(sender, "username", "") or ""
@@ -263,20 +239,27 @@ async def handle_message(event):
     ])) or username or str(user_id)
     chat_id = event.chat_id
 
+    # ── Every message → Gemini ─────────────────────────────────────────────
     result = await analyse_message(message_text)
 
     if result["verdict"] != "PROHIBITED":
-        return
+        return  # clean — bot stays silent
 
+    # ── Violation ──────────────────────────────────────────────────────────
     violation_reason = result["reason"]
+
+    # Always delete first
     await delete_message(chat_id, event.id)
+
     prior_warnings = get_warning_count(user_id)
 
     if prior_warnings == 0:
+        # First offence → public warning in group
         record_violation(user_id, username, full_name, violation_reason)
         await send_warning(event, violation_reason)
         log.info("⚠️  Warned %s (%s) — %s", full_name, user_id, violation_reason)
     else:
+        # Second offence → ban + silent admin report, no group message
         record_violation(user_id, username, full_name, violation_reason)
         await ban_user(chat_id, user_id)
         await notify_admin(
@@ -292,11 +275,10 @@ async def handle_message(event):
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 async def main():
-    init_db()
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     log.info("🤖 Bot running as @%s (ID: %s)", me.username, me.id)
-    log.info("📡 Gemini is analysing every message...")
+    log.info("📡 Gemini analysing every message...")
     log.info("👤 Admin reports → ID: %s", ADMIN_ID)
     await client.run_until_disconnected()
 
