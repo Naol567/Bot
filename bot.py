@@ -2,13 +2,14 @@
 Forex Group Management Bot
 Powered by Telethon + Gemini AI
 Supports: English + Amharic
-Status: Final Stable Version (Fixes 404 & Version Issues)
+Status: Final Stable Version (Improved JSON Parsing)
 """
 
 import os
 import asyncio
 import logging
 import json
+import re
 from datetime import datetime
 
 from telethon import TelegramClient, events
@@ -64,28 +65,31 @@ SYSTEM_PROMPT = """You are a smart moderator. Analyze the message for a Forex gr
 - ALLOW: Greetings (ሰላም, እንዴት ናችሁ), Forex discussion, charts, help requests.
 - PROHIBITED: Insults (English/Amharic), DM for signals, Spam links, Scams.
 
-Response MUST be ONLY JSON:
+Response MUST be ONLY a JSON object:
 {"verdict": "ALLOWED" or "PROHIBITED", "reason": "short explanation"}"""
 
 async def analyse_message(text: str):
     try:
-        # ጥያቄውን በምንልክበት ጊዜ ስሪቱን በግልጽ እንጥቀስ
         response = await asyncio.to_thread(
             gemini_model.generate_content,
             f"{SYSTEM_PROMPT}\n\nMessage: {text[:1000]}"
         )
         
-        raw = response.text.strip()
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
+        raw_text = response.text.strip()
+        
+        # JSON ለማግኘት ይበልጥ አስተማማኝ የሆነ Regex ዘዴ
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            data = json.loads(json_str)
+            return {
+                "verdict": str(data.get("verdict", "ALLOWED")).upper(),
+                "reason": str(data.get("reason", "Violation detected."))
+            }
+        else:
+            log.warning("⚠️ No JSON found in Gemini response: %s", raw_text)
+            return {"verdict": "ALLOWED", "reason": "Parsing failed."}
             
-        data = json.loads(raw)
-        return {
-            "verdict": str(data.get("verdict", "ALLOWED")).upper(),
-            "reason": str(data.get("reason", "Violation detected."))
-        }
     except Exception as exc:
         log.warning("⚠️ Gemini API Error: %s. Defaulting to ALLOWED.", exc)
         return {"verdict": "ALLOWED", "reason": "Safe mode bypass."}
