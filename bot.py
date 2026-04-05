@@ -34,7 +34,7 @@ GROUP_ID   = int(os.environ["GROUP_ID"])
 
 # ─── Gemini Setup ─────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel("gemini-pro")
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # ─── Telethon Client ──────────────────────────────────────────────────────────
 client = TelegramClient("bot_session", API_ID, API_HASH)
