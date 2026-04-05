@@ -1,22 +1,20 @@
 """
 Forex Group Management Bot
-Powered by Telethon + New Gemini SDK (google-genai)
+Powered by Telethon + Gemini AI
 Supports: English + Amharic
-Status: Fully Adjusted for Railway (In-memory storage)
+Status: Stable Version (Fixes ImportError & 404)
 """
 
 import os
 import asyncio
 import logging
 import json
-import re
 from datetime import datetime
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
-# አዲሱ ላይብረሪ 404 ስህተትን ለመከላከል
-from google import genai
+import google.generativeai as genai
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,62 +31,54 @@ GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 ADMIN_ID   = int(os.environ["ADMIN_ID"])
 GROUP_ID   = int(os.environ["GROUP_ID"])
 
-# ─── Gemini Setup (New SDK) ───────────────────────────────────────────────────
-# የድሮው genai.configure አሰራር በአዲሱ client_ai ተተክቷል
-client_ai = genai.Client(api_key=GEMINI_KEY)
+# ─── Gemini Setup ─────────────────────────────────────────────────────────────
+genai.configure(api_key=GEMINI_KEY)
+# አስተማማኙን ሞዴል ስም እንጠቀማለን
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # ─── Telethon Client ──────────────────────────────────────────────────────────
 client = TelegramClient("bot_session", API_ID, API_HASH)
 
 # ─── In-Memory Warning Store ──────────────────────────────────────────────────
-warnings_db: dict = {}
+# Railway ላይ ቮልዩም ስለሌለ ዳታው በሜሞሪ ይያዛል
+warnings_db = {}
 
-def get_warning_count(user_id: int) -> int:
+def get_warning_count(user_id):
     return warnings_db.get(user_id, {}).get("count", 0)
 
-def record_violation(user_id: int, username: str, full_name: str, reason: str):
+def record_violation(user_id, username, full_name, reason):
     if user_id in warnings_db:
         warnings_db[user_id]["count"] += 1
     else:
         warnings_db[user_id] = {
-            "count": 1,
-            "username": username,
+            "count": 1, 
+            "username": username, 
             "full_name": full_name,
-            "last_reason": reason,
+            "reason": reason
         }
-    log.info("📋 User %s warning count: %s", user_id, warnings_db[user_id]["count"])
+    log.info("📋 Warning recorded for %s. Total: %s", user_id, warnings_db[user_id]["count"])
 
-# ─── Gemini Analysis Logic ────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a professional Telegram moderator for a Forex group.
-Language: Amharic and English.
+# ─── Gemini Analysis ──────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a professional Forex group moderator. 
+Analyze messages in English and Amharic.
 
-POLICIES:
-1. ALLOW: 
-   - Friendly chat, greetings (ሰላም, እንዴት ናችሁ), and general conversation.
-   - Forex analysis, chart sharing, trading questions.
-   - Genuine debates about brokers or strategies.
+RULES:
+1. ALLOW: Greetings (ሰላም, እንዴት ናችሁ), general trading talk, charts, and polite discussion.
+2. PROHIBITED: Insults (ስድብ), "DM for signals", VIP links, scams, and spam.
 
-2. PROHIBITED:
-   - INSULTS: Personal attacks, hate speech, or rude language in Amharic/English.
-   - SPAM: "DM me for signals", VIP group invites, Referral links.
-   - SCAMS: Asking for money or promising guaranteed profits.
+Response MUST be valid JSON:
+{"verdict": "ALLOWED" or "PROHIBITED", "reason": "one short sentence"}"""
 
-3. BIO/NAME CHECK:
-   - If user profile is pure advertising (e.g. "I sell accounts"), mark PROHIBITED.
-
-Response Format (Strict JSON):
-{"verdict": "ALLOWED" or "PROHIBITED", "reason": "short explanation"}"""
-
-async def analyse_message(text: str) -> dict:
+async def analyse_message(text: str):
     try:
-        # በአዲሱ SDK መሠረት የተስተካከለ የጥሪ ዘዴ
-        response = client_ai.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=f"{SYSTEM_PROMPT}\n\nMessage to analyze: {text[:1500]}"
+        # በ thread ውስጥ መጥራቱ አንዳንዴ በ async ውስጥ የሚፈጠርን የሞዴል ስህተት ይቀንሳል
+        response = await asyncio.to_thread(
+            gemini_model.generate_content,
+            f"{SYSTEM_PROMPT}\n\nMessage: {text[:1000]}"
         )
         
         raw = response.text.strip()
-        # JSON Clean-up (Markdown ካለ ለማጥፋት)
+        # Clean JSON markdown if present
         if "```json" in raw:
             raw = raw.split("```json")[1].split("```")[0].strip()
         elif "```" in raw:
@@ -97,20 +87,14 @@ async def analyse_message(text: str) -> dict:
         data = json.loads(raw)
         return {
             "verdict": str(data.get("verdict", "ALLOWED")).upper(),
-            "reason": str(data.get("reason", "Policy check failed."))
+            "reason": str(data.get("reason", "Violation detected."))
         }
     except Exception as exc:
-        log.warning("⚠️ Gemini Error (404/API): %s - Defaulting to ALLOWED", exc)
-        return {"verdict": "ALLOWED", "reason": "System bypass."}
+        log.warning("⚠️ Gemini API Error: %s. Defaulting to ALLOWED.", exc)
+        return {"verdict": "ALLOWED", "reason": "System safe mode."}
 
 # ─── Moderation Actions ───────────────────────────────────────────────────────
-async def delete_message(chat_id: int, message_id: int):
-    try:
-        await client.delete_messages(chat_id, message_id)
-    except Exception as exc:
-        log.error("Delete failed: %s", exc)
-
-async def ban_user(chat_id: int, user_id: int):
+async def ban_user(chat_id, user_id):
     try:
         await client(EditBannedRequest(
             channel=chat_id,
@@ -125,10 +109,11 @@ async def ban_user(chat_id: int, user_id: int):
                 embed_links=True
             )
         ))
+        log.info("🔨 Banned user %s", user_id)
     except Exception as exc:
-        log.error("Ban failed: %s", exc)
+        log.error("❌ Ban failed for %s: %s", user_id, exc)
 
-async def notify_admin(user_id, username, full_name, text, reason):
+async def notify_admin(user_id, full_name, text, reason):
     try:
         report = (
             f"🔨 **User Banned**\n"
@@ -139,9 +124,9 @@ async def notify_admin(user_id, username, full_name, text, reason):
         )
         await client.send_message(ADMIN_ID, report)
     except Exception as exc:
-        log.error("Admin report failed: %s", exc)
+        log.error("❌ Admin notify failed: %s", exc)
 
-# ─── Event Handler ────────────────────────────────────────────────────────────
+# ─── Main Handler ────────────────────────────────────────────────────────────
 @client.on(events.NewMessage(chats=GROUP_ID))
 async def handle_message(event):
     if event.out: return
@@ -151,32 +136,32 @@ async def handle_message(event):
     text = event.raw_text or ""
     if not text.strip(): return
     
-    # Analyze with Gemini
     result = await analyse_message(text)
     
     if result["verdict"] == "PROHIBITED":
-        await delete_message(event.chat_id, event.id)
-        user_id = sender.id
-        count = get_warning_count(user_id)
+        # Delete offending message
+        await event.delete()
         
+        user_id = sender.id
         full_name = getattr(sender, 'first_name', 'User')
         username = getattr(sender, 'username', '')
-
+        count = get_warning_count(user_id)
+        
         if count == 0:
             record_violation(user_id, username, full_name, result["reason"])
             await event.reply(
                 f"⚠️ **ማስጠንቀቂያ / Warning**\n\n"
                 f"ምክንያት: {result['reason']}\n\n"
-                f"ይህ የመጨረሻ ማስጠንቀቂያዎ ነው። ደግመው ካጠፉ ይታገዳሉ።"
+                f"ይህ የመጀመሪያ ማስጠንቀቂያዎ ነው። ደግመው ካጠፉ ይታገዳሉ።"
             )
         else:
             await ban_user(event.chat_id, user_id)
-            await notify_admin(user_id, username, full_name, text, result["reason"])
+            await notify_admin(user_id, full_name, text, result["reason"])
 
-# ─── Execution ────────────────────────────────────────────────────────────────
+# ─── Start Bot ────────────────────────────────────────────────────────────────
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    log.info("🚀 Bot is live with NEW Gemini SDK (google-genai)!")
+    log.info("🚀 Bot is live and monitoring group %s...", GROUP_ID)
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
