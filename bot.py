@@ -1,42 +1,37 @@
 """
 Forex Group Management Bot
-Powered by Telethon + Gemini AI
-Status: Final Fix for 404 Model Not Found
+Powered by Telethon + OpenAI (GPT-4o mini)
+Status: Highly Stable Version (Fixes 404 & ImportError)
 """
 
 import os
 import asyncio
 import logging
 import json
-import re
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
-import google.generativeai as genai
+from openai import AsyncOpenAI
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
+# ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── Environment Variables ────────────────────────────────────────────────────
-API_ID     = int(os.environ["API_ID"])
-API_HASH   = os.environ["API_HASH"]
-BOT_TOKEN  = os.environ["BOT_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-ADMIN_ID   = int(os.environ["ADMIN_ID"])
-GROUP_ID   = int(os.environ["GROUP_ID"])
+API_ID         = int(os.environ["API_ID"])
+API_HASH       = os.environ["API_HASH"]
+BOT_TOKEN      = os.environ["BOT_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+ADMIN_ID       = int(os.environ["ADMIN_ID"])
+GROUP_ID       = int(os.environ["GROUP_ID"])
 
-# ─── Gemini Setup ─────────────────────────────────────────────────────────────
-# 404 ስህተትን ለመፍታት ስሪቱን እና የሞዴሉን ስም እናስተካክላለን
-genai.configure(api_key=GEMINI_KEY)
-
-# ይበልጥ አስተማማኝ የሆነውን 'gemini-1.5-flash-latest' እንጠቀም
-gemini_model = genai.GenerativeModel("gemini-1.5-flash-latest")
+# ─── OpenAI Client ────────────────────────────────────────────────────────────
+ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # ─── Telethon Client ──────────────────────────────────────────────────────────
 client = TelegramClient("bot_session", API_ID, API_HASH)
 
-# ─── In-Memory Warning Store ──────────────────────────────────────────────────
+# ─── In-Memory Warning Database ───────────────────────────────────────────────
 warnings_db = {}
 
 def get_warning_count(user_id):
@@ -49,38 +44,36 @@ def record_violation(user_id, username, full_name, reason):
         warnings_db[user_id] = {"count": 1, "username": username, "full_name": full_name}
     log.info(f"📋 Warning for {user_id}: Total {warnings_db[user_id]['count']}")
 
-# ─── Gemini Analysis ──────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a group moderator. Respond ONLY in JSON format:
-{"verdict": "ALLOWED" or "PROHIBITED", "reason": "short explanation"}
-Rules: No insults, no scam links, no 'DM for signals'."""
+# ─── AI Analysis ──────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a professional Forex group moderator. 
+Analyze messages in English and Amharic.
+Rules: Prohibit insults, scam links, 'DM for signals', and off-topic ads.
+Allow: Greetings, Forex charts, and polite trading questions.
+
+Response MUST be ONLY a JSON object:
+{"verdict": "ALLOWED" or "PROHIBITED", "reason": "Short explanation in Amharic"}"""
 
 async def analyse_message(text: str):
     try:
-        # ጥያቄው በ 'v1' stable API እንዲሄድ እናስገድዳለን
-        response = await asyncio.to_thread(
-            gemini_model.generate_content,
-            f"{SYSTEM_PROMPT}\n\nMessage: {text[:800]}"
+        response = await ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Message: {text[:800]}"}
+            ],
+            response_format={ "type": "json_object" },
+            timeout=10.0
         )
-        
-        if not response or not response.text:
-            return {"verdict": "ALLOWED", "reason": "Empty response"}
-
-        raw_text = response.text.strip()
-        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            return {
-                "verdict": str(data.get("verdict", "ALLOWED")).upper(),
-                "reason": str(data.get("reason", "Violation detected."))
-            }
-        return {"verdict": "ALLOWED", "reason": "No JSON"}
-            
+        data = json.loads(response.choices[0].message.content)
+        return {
+            "verdict": str(data.get("verdict", "ALLOWED")).upper(),
+            "reason": str(data.get("reason", "የደንብ መጣስ ታይቷል።"))
+        }
     except Exception as exc:
-        # 404 ካጋጠመ እዚህ ጋር ሎግ ያደርጋል
-        log.error(f"⚠️ Gemini Error Detail: {exc}")
-        return {"verdict": "ALLOWED", "reason": "API Error Fallback"}
+        log.error(f"⚠️ OpenAI Error: {exc}")
+        return {"verdict": "ALLOWED", "reason": "System bypass."}
 
-# ─── Event Handler ────────────────────────────────────────────────────────────
+# ─── Main Handler ─────────────────────────────────────────────────────────────
 @client.on(events.NewMessage(chats=GROUP_ID))
 async def handle_message(event):
     if event.out: return
@@ -105,12 +98,12 @@ async def handle_message(event):
                 await client(EditBannedRequest(event.chat_id, user_id, ChatBannedRights(until_date=None, view_messages=True, send_messages=True)))
                 await client.send_message(ADMIN_ID, f"🔨 **Banned:** `{user_id}`\n**Reason:** {result['reason']}")
         except Exception as e:
-            log.error(f"Moderation failed: {e}")
+            log.error(f"Action failed: {e}")
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    log.info("🚀 Bot is live and fixed...")
+    log.info("🚀 Bot is live with OpenAI GPT-4o mini!")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
