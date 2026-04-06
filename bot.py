@@ -323,8 +323,7 @@ async def send_warning(event, reason: str, user_id: int, username: str, full_nam
             f"⚠️ **Warning / ማስጠንቀቂያ** — {mention}\n\n"
             f"🇬🇧 This is your **only warning**. Next violation = immediate ban.\n"
             f"🇪🇹 ይህ **የመጨረሻ ማስጠንቀቂያዎ** ነው። ደግመው ከጣሱ ወዲያውኑ ይታገዳሉ።\n\n"
-            f"📋 **Reason:** {reason}\n\n"
-            f"_🕐 This warning will be deleted in 5 minutes._",
+            f"📋 **Reason:** {reason}",
             parse_mode="md"
         )
         log.info("⚠️ Warning sent to %s, auto-delete in 5min", user_id)
