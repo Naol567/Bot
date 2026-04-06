@@ -29,13 +29,30 @@ log = logging.getLogger(__name__)
 API_ID     = int(os.environ["API_ID"])
 API_HASH   = os.environ["API_HASH"]
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 ADMIN_ID   = int(os.environ["ADMIN_ID"])
 GROUP_ID   = int(os.environ["GROUP_ID"])
 
-# ─── Gemini Setup ─────────────────────────────────────────────────────────────
-genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+# ─── Gemini Setup — Key Rotation ──────────────────────────────────────────────
+# GEMINI_API_KEY can be one key or multiple comma-separated keys:
+# e.g. AIzaSyKEY1,AIzaSyKEY2,AIzaSyKEY3
+_raw_keys = os.environ["GEMINI_API_KEY"]
+GEMINI_KEYS: list = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+_current_key_index = 0
+
+def get_gemini_model() -> genai.GenerativeModel:
+    """Return a Gemini model using the current active key."""
+    genai.configure(api_key=GEMINI_KEYS[_current_key_index])
+    return genai.GenerativeModel("gemini-2.0-flash")
+
+def rotate_key() -> bool:
+    """Rotate to the next API key. Returns True if rotated, False if exhausted all keys."""
+    global _current_key_index
+    next_index = (_current_key_index + 1) % len(GEMINI_KEYS)
+    if next_index == 0 and len(GEMINI_KEYS) == 1:
+        return False  # only one key, can't rotate
+    _current_key_index = next_index
+    log.info("🔄 Rotated to Gemini key #%s", _current_key_index + 1)
+    return True
 
 # ─── Telethon Client ──────────────────────────────────────────────────────────
 client = TelegramClient("bot_session", API_ID, API_HASH)
@@ -271,23 +288,55 @@ Respond ONLY with valid JSON, no markdown:
 
 
 async def analyse_with_gemini(text: str) -> dict:
-    try:
-        prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
-        response = await asyncio.to_thread(
-            gemini_model.generate_content, prompt
-        )
-        raw = response.text.strip()
-        raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
-        data = json.loads(raw)
-        verdict = str(data.get("verdict", "ALLOWED")).upper()
-        reason  = str(data.get("reason", "No reason."))
-        if verdict not in ("ALLOWED", "PROHIBITED"):
-            verdict = "ALLOWED"
-        log.info("🤖 Gemini → %s | %s", verdict, reason)
-        return {"verdict": verdict, "reason": reason}
-    except Exception as exc:
-        log.warning("⚠️ Gemini error: %s", exc)
-        return {"verdict": "ALLOWED", "reason": "Gemini unavailable."}
+    """
+    Sends message to Gemini with key rotation + retry on 429 quota errors.
+    Tries every available key before giving up.
+    Always fails SAFE -> ALLOWED.
+    """
+    prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
+    keys_tried = 0
+    total_keys = len(GEMINI_KEYS)
+
+    while keys_tried < total_keys:
+        try:
+            model = get_gemini_model()
+            response = await asyncio.to_thread(model.generate_content, prompt)
+            raw = response.text.strip()
+            raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
+            data = json.loads(raw)
+            verdict = str(data.get("verdict", "ALLOWED")).upper()
+            reason  = str(data.get("reason", "No reason."))
+            if verdict not in ("ALLOWED", "PROHIBITED"):
+                verdict = "ALLOWED"
+            log.info("🤖 Gemini [key#%s] → %s | %s", _current_key_index + 1, verdict, reason)
+            return {"verdict": verdict, "reason": reason}
+
+        except Exception as exc:
+            err_str = str(exc)
+
+            # 429 quota exceeded — rotate key and retry
+            if "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
+                log.warning("⚠️ Gemini key #%s quota exceeded. Rotating...", _current_key_index + 1)
+                keys_tried += 1
+                rotated = rotate_key()
+
+                if not rotated or keys_tried >= total_keys:
+                    # All keys exhausted — wait for retry_delay if mentioned in error
+                    retry_wait = 60  # default
+                    match = re.search(r"retry.*?(\d+)", err_str, re.IGNORECASE)
+                    if match:
+                        retry_wait = min(int(match.group(1)), 120)  # cap at 2 min
+                    log.warning("⏳ All %s Gemini key(s) exhausted. Waiting %ss then retrying...", total_keys, retry_wait)
+                    await asyncio.sleep(retry_wait)
+                    keys_tried = 0  # reset and try all keys once more after wait
+                continue
+
+            # Other error (network, parse, etc.) — log and fail safe
+            log.warning("⚠️ Gemini error: %s", exc)
+            return {"verdict": "ALLOWED", "reason": "Gemini error — safe default."}
+
+    log.warning("⚠️ All Gemini keys failed — defaulting ALLOWED")
+    return {"verdict": "ALLOWED", "reason": "All Gemini keys exhausted — keyword filter still active."}
 
 # ─── Moderation Actions ───────────────────────────────────────────────────────
 
