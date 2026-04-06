@@ -5,6 +5,7 @@ Forex Group Management Bot
 - Key rotation + retry on quota
 - English + Amharic support
 - Railway deployment
+- ENHANCED: Full link detection + extended insult list
 """
 
 import os
@@ -103,6 +104,11 @@ banned_words: list = [
     "you idiot", "you are stupid", "you are dumb",
     "you fool", "shut up", "go to hell",
     "son of a bitch", "motherfucker", "you loser",
+    # === ADDED MORE ENGLISH INSULTS ===
+    "stupid", "idiot", "dumb", "fool", "moron", "retard",
+    "bastard", "bitch", "cunt", "dick", "pussy", "asshole",
+    "fuck you", "suck my", "eat shit", "kill yourself",
+    "worthless", "piece of shit", "dumbass", "dipshit",
 
     # ── AMHARIC: Signal selling / VIP promotion ───────────────────────────
     "ሲግናል እሸጣለሁ", "ሲግናል እልካለሁ", "ሲግናል ይግዙ",
@@ -133,7 +139,24 @@ banned_words: list = [
     "ደደብ ነህ", "ደደብ ነሽ", "ሞኝ ነህ", "ሞኝ ነሽ",
     "ዝምበል", "ውሻ", "አህያ", "ጅል ነህ", "ጅል ነሽ",
     "ከንቱ", "ጊዜ ሌባ", "ፋይዳ የለህም", "ፋይዳ የለሽም",
+    # === ADDED MORE AMHARIC INSULTS ===
+    "ርኩስ", "ርኩስ ውሻ", "ዘባኝ", "ደም ጠጪ", "አጭበርባሪ",
+    "ሐሰተኛ", "ክፉ", "ጠላት", "ዲያብሎስ", "ሰይጣን",
+    "ቆሻሻ", "እንኳን አትሞት", "ልብህ ይበሰብስ", "ፊትህ ይጥላ",
 ]
+
+# ─── NEW: Comprehensive link detection (all link types) ───────────────────────
+# Matches http://, https://, t.me/, telegram.me/, bit.ly/, wa.me/, short domains,
+# and any typical domain with TLD (e.g., example.com/path)
+LINK_PATTERN = re.compile(
+    r'https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|bit\.ly/\S+|wa\.me/\S+|'
+    r'\b[a-z0-9.-]+\.[a-z]{2,}(?:/\S*)?\b',
+    re.IGNORECASE
+)
+
+def contains_link(text: str) -> bool:
+    """Return True if message contains any URL or link pattern."""
+    return bool(LINK_PATTERN.search(text))
 
 # ─── Suspicious patterns that trigger Gemini ──────────────────────────────────
 # Only messages matching these patterns get sent to Gemini.
@@ -402,11 +425,12 @@ async def cmd_start(event):
         "/filter — Manage banned keywords\n\n"
         "**How it works:**\n"
         "1️⃣ Every message checked against keyword list (instant)\n"
-        "2️⃣ Suspicious messages → Gemini AI queue\n"
-        "3️⃣ Pure Forex talk → skipped (saves quota)\n"
-        "4️⃣ Violation → message deleted\n"
-        "5️⃣ 1st offence → warning (deleted after 5min)\n"
-        "6️⃣ 2nd offence → ban + private report\n\n"
+        "2️⃣ **NEW:** Any link (http, t.me, bit.ly, etc.) = instant violation\n"
+        "3️⃣ Suspicious messages → Gemini AI queue\n"
+        "4️⃣ Pure Forex talk → skipped (saves quota)\n"
+        "5️⃣ Violation → message deleted\n"
+        "6️⃣ 1st offence → warning (deleted after 5min)\n"
+        "7️⃣ 2nd offence → ban + private report\n\n"
         "✅ English & Amharic | 🔄 Multi-key rotation"
     )
 
@@ -537,14 +561,18 @@ async def handle_group_message(event):
 
     log.info("📨 [%s | %s]: %s", full_name, user_id, message_text[:80])
 
-    # ── Layer 1: Keyword filter — instant, no API ──────────────────────────
-    matched_word = keyword_is_banned(message_text)
-    if matched_word:
+    # ── Layer 1: Link detection (ALL links are prohibited) ──────────────────
+    if contains_link(message_text):
+        violation_reason = "Message contains a link (URL) — all links are prohibited."
+        log.info("🚫 Link detected: %s", message_text[:80])
+
+    # ── Layer 2: Keyword filter — instant, no API ──────────────────────────
+    elif (matched_word := keyword_is_banned(message_text)):
         violation_reason = f"Message contains banned word: '{matched_word}'"
         log.info("🚫 Keyword hit: '%s'", matched_word)
 
     else:
-        # ── Layer 2: Smart Gemini — only suspicious messages ───────────────
+        # ── Layer 3: Smart Gemini — only suspicious messages ───────────────
         result = await queue_gemini_analysis(message_text)
         if result["verdict"] != "PROHIBITED":
             return  # clean — stay completely silent
