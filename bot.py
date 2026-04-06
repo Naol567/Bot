@@ -225,6 +225,66 @@ banned_words: list = [
     "ፋይዳ የለሽም",
 ]
 
+# ─── Gemini Rate Limiter + Queue ─────────────────────────────────────────────
+# Limits Gemini to max 10 requests/minute per key (safe under free tier 15 RPM)
+# Messages queue up and are processed one at a time — keyword filter is unaffected
+
+GEMINI_RPM_LIMIT   = 10          # max requests per minute (conservative)
+GEMINI_MIN_GAP     = 60 / GEMINI_RPM_LIMIT  # seconds between requests = 6s
+SKIP_SHORT_WORDS   = 4           # skip Gemini for messages under this many words
+
+_gemini_queue: asyncio.Queue = asyncio.Queue()
+_last_gemini_call: float = 0.0
+
+
+async def gemini_queue_worker():
+    """
+    Background worker that processes Gemini requests one at a time
+    with a minimum gap between calls to respect RPM limits.
+    """
+    global _last_gemini_call
+    while True:
+        text, future = await _gemini_queue.get()
+        try:
+            # Enforce minimum gap between requests
+            now = asyncio.get_event_loop().time()
+            gap = GEMINI_MIN_GAP - (now - _last_gemini_call)
+            if gap > 0:
+                await asyncio.sleep(gap)
+
+            result = await analyse_with_gemini(text)
+            _last_gemini_call = asyncio.get_event_loop().time()
+            future.set_result(result)
+        except Exception as exc:
+            future.set_exception(exc)
+        finally:
+            _gemini_queue.task_done()
+
+
+async def queue_gemini_analysis(text: str) -> dict:
+    """
+    Submit a message to the Gemini queue and wait for result.
+    Short messages (under SKIP_SHORT_WORDS words) are skipped entirely.
+    """
+    word_count = len(text.strip().split())
+    if word_count < SKIP_SHORT_WORDS:
+        log.info("⏭️ Skipping Gemini for short message (%s words)", word_count)
+        return {"verdict": "ALLOWED", "reason": "Short message skipped."}
+
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    await _gemini_queue.put((text, future))
+    log.info("📥 Queued for Gemini (queue size: %s)", _gemini_queue.qsize())
+    try:
+        return await asyncio.wait_for(future, timeout=180)  # 3 min max wait
+    except asyncio.TimeoutError:
+        log.warning("⏰ Gemini queue timeout — defaulting ALLOWED")
+        return {"verdict": "ALLOWED", "reason": "Gemini timeout — safe default."}
+    except Exception as exc:
+        log.warning("⚠️ Queue error: %s — defaulting ALLOWED", exc)
+        return {"verdict": "ALLOWED", "reason": "Queue error — safe default."}
+
+
 # ─── Warning Helpers ──────────────────────────────────────────────────────────
 
 def get_warning_count(user_id: int) -> int:
@@ -586,7 +646,7 @@ async def handle_group_message(event):
         log.info("🚫 Keyword hit: '%s'", matched_word)
     else:
         # ── Layer 2: Gemini AI ─────────────────────────────────────────────
-        result = await analyse_with_gemini(message_text)
+        result = await queue_gemini_analysis(message_text)
         if result["verdict"] != "PROHIBITED":
             return  # clean — stay silent
         violation_reason = result["reason"]
@@ -621,7 +681,10 @@ async def main():
     except Exception as exc:
         log.error("❌ Cannot access group %s: %s", GROUP_ID, exc)
 
-    log.info("📡 Gemini: gemini-2.0-flash | Filter: /filter in bot DM")
+    # Start Gemini queue worker
+    asyncio.create_task(gemini_queue_worker())
+    log.info("📡 Gemini: gemini-2.0-flash | RPM limit: %s req/min | Queue: active", GEMINI_RPM_LIMIT)
+    log.info("⏭️ Short messages under %s words skip Gemini", SKIP_SHORT_WORDS)
     log.info("👤 Admin: %s", ADMIN_ID)
     await client.run_until_disconnected()
 
