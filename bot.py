@@ -311,14 +311,31 @@ async def ban_user(chat_id: int, user_id: int):
         log.error("Ban failed for %s: %s", user_id, exc)
 
 
-async def send_warning(event, reason: str):
+async def send_warning(event, reason: str, user_id: int, username: str, full_name: str):
     try:
-        await event.reply(
-            f"⚠️ **Warning / ማስጠንቀቂያ**\n\n"
+        # Mention user by @username or inline mention if no username
+        if username:
+            mention = f"@{username}"
+        else:
+            mention = f"[{full_name}](tg://user?id={user_id})"
+
+        warning_msg = await event.respond(
+            f"⚠️ **Warning / ማስጠንቀቂያ** — {mention}\n\n"
             f"🇬🇧 This is your **only warning**. Next violation = immediate ban.\n"
             f"🇪🇹 ይህ **የመጨረሻ ማስጠንቀቂያዎ** ነው። ደግመው ከጣሱ ወዲያውኑ ይታገዳሉ።\n\n"
-            f"📋 **Reason:** {reason}"
+            f"📋 **Reason:** {reason}\n\n"
+            f"_🕐 This warning will be deleted in 5 minutes._",
+            parse_mode="md"
         )
+        log.info("⚠️ Warning sent to %s, auto-delete in 5min", user_id)
+
+        async def delete_warning_later():
+            await asyncio.sleep(300)
+            await delete_msg(event.chat_id, warning_msg.id)
+            log.info("🗑️ Warning auto-deleted (msg_id=%s)", warning_msg.id)
+
+        asyncio.create_task(delete_warning_later())
+
     except Exception as exc:
         log.warning("Warning send failed: %s", exc)
 
@@ -532,7 +549,7 @@ async def handle_group_message(event):
 
     if prior == 0:
         record_violation(user_id, username, full_name, violation_reason)
-        await send_warning(event, violation_reason)
+        await send_warning(event, violation_reason, user_id, username, full_name)
         log.info("⚠️ Warned %s (%s)", full_name, user_id)
     else:
         record_violation(user_id, username, full_name, violation_reason)
