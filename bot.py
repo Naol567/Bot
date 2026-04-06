@@ -1,7 +1,8 @@
 """
 Forex Group Management Bot
-- Gemini AI analysis
+- Smart Gemini usage (only suspicious messages)
 - Admin keyword filter with inline buttons
+- Key rotation + retry on quota
 - English + Amharic support
 - Railway deployment
 """
@@ -33,23 +34,23 @@ ADMIN_ID   = int(os.environ["ADMIN_ID"])
 GROUP_ID   = int(os.environ["GROUP_ID"])
 
 # ─── Gemini Setup — Key Rotation ──────────────────────────────────────────────
-# GEMINI_API_KEY can be one key or multiple comma-separated keys:
+# GEMINI_API_KEY supports multiple comma-separated keys:
 # e.g. AIzaSyKEY1,AIzaSyKEY2,AIzaSyKEY3
 _raw_keys = os.environ["GEMINI_API_KEY"]
 GEMINI_KEYS: list = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 _current_key_index = 0
 
+
 def get_gemini_model() -> genai.GenerativeModel:
-    """Return a Gemini model using the current active key."""
     genai.configure(api_key=GEMINI_KEYS[_current_key_index])
     return genai.GenerativeModel("gemini-2.0-flash")
 
+
 def rotate_key() -> bool:
-    """Rotate to the next API key. Returns True if rotated, False if exhausted all keys."""
     global _current_key_index
     next_index = (_current_key_index + 1) % len(GEMINI_KEYS)
     if next_index == 0 and len(GEMINI_KEYS) == 1:
-        return False  # only one key, can't rotate
+        return False
     _current_key_index = next_index
     log.info("🔄 Rotated to Gemini key #%s", _current_key_index + 1)
     return True
@@ -59,305 +60,206 @@ client = TelegramClient("bot_session", API_ID, API_HASH)
 
 # ─── In-Memory Stores ─────────────────────────────────────────────────────────
 warnings_db: dict = {}
-admin_state: dict = {}   # { ADMIN_ID: "awaiting_add" | "awaiting_remove" }
+admin_state: dict = {}
 
 # ─── Pre-loaded Banned Words (English + Amharic) ──────────────────────────────
-# Admin can add/remove more via /filter command in bot DM
 banned_words: list = [
 
     # ── ENGLISH: Signal selling / VIP promotion ───────────────────────────
-    "dm me for signals",
-    "dm for signals",
-    "i sell signals",
-    "selling signals",
-    "join my vip",
-    "join our vip",
-    "vip signals",
-    "paid signals",
-    "premium signals",
-    "signal provider",
-    "signal service",
-    "buy signals",
-    "my signals",
+    "dm me for signals", "dm for signals", "i sell signals",
+    "selling signals", "join my vip", "join our vip",
+    "vip signals", "paid signals", "premium signals",
+    "signal provider", "signal service", "buy signals",
 
     # ── ENGLISH: Recruitment / invite spam ────────────────────────────────
-    "join my group",
-    "join our group",
-    "join my channel",
-    "join our channel",
-    "subscribe to my channel",
-    "click the link",
-    "link in bio",
-    "check my bio",
-    "use my referral",
-    "referral link",
-    "use my link",
-    "register with my link",
-    "deposit via my link",
-    "use my code",
-    "promo code",
-    "invite link",
+    "join my group", "join our group", "join my channel",
+    "join our channel", "subscribe to my channel",
+    "click the link", "link in bio", "check my bio",
+    "use my referral", "referral link", "use my link",
+    "register with my link", "deposit via my link",
+    "use my code", "promo code", "invite link",
 
     # ── ENGLISH: Scam / guaranteed profit ─────────────────────────────────
-    "guaranteed profit",
-    "guaranteed return",
-    "100% profit",
-    "risk free",
-    "risk-free",
-    "no loss",
-    "double your money",
-    "i will manage your account",
-    "managed account",
-    "send me money",
-    "send usdt",
-    "send btc",
-    "invest with me",
-    "investment platform",
-    "fund your account",
-    "withdraw daily",
-    "earn daily",
-    "earn money online",
-    "make money online",
-    "passive income",
-    "financial freedom",
+    "guaranteed profit", "guaranteed return", "100% profit",
+    "risk free", "risk-free", "no loss", "double your money",
+    "i will manage your account", "managed account",
+    "send me money", "send usdt", "send btc", "invest with me",
+    "investment platform", "fund your account", "withdraw daily",
+    "earn daily", "earn money online", "make money online",
+    "passive income", "financial freedom",
 
     # ── ENGLISH: Account selling ───────────────────────────────────────────
-    "account for sale",
-    "selling account",
-    "buying account",
-    "broker account for sale",
-    "ea for sale",
-    "robot for sale",
-    "trading bot for sale",
+    "account for sale", "selling account", "buying account",
+    "broker account for sale", "ea for sale",
+    "robot for sale", "trading bot for sale",
 
     # ── ENGLISH: Contact solicitation ─────────────────────────────────────
-    "whatsapp me",
-    "contact me on whatsapp",
-    "dm me",
-    "message me",
-    "inbox me",
-    "contact for promo",
-    "available for hire",
-    "hire me",
-    "i offer services",
-    "we offer services",
+    "whatsapp me", "contact me on whatsapp", "dm me",
+    "message me", "inbox me", "contact for promo",
+    "available for hire", "hire me",
+    "i offer services", "we offer services",
 
     # ── ENGLISH: Personal insults ─────────────────────────────────────────
-    "you idiot",
-    "you are stupid",
-    "you are dumb",
-    "you fool",
-    "shut up",
-    "go to hell",
-    "son of a bitch",
-    "motherfucker",
-    "you loser",
-    "you are a scammer",
+    "you idiot", "you are stupid", "you are dumb",
+    "you fool", "shut up", "go to hell",
+    "son of a bitch", "motherfucker", "you loser",
 
     # ── AMHARIC: Signal selling / VIP promotion ───────────────────────────
-    "ሲግናል እሸጣለሁ",
-    "ሲግናል እልካለሁ",
-    "ሲግናል ይግዙ",
-    "ሲግናል ይጠቀሙ",
-    "ሲግናል ቡድን",
-    "ዲኤም አድርጉ",
-    "ዲኤም አድርጉኝ",
-    "ለሲግናል ዲኤም",
-    "ቪአይፒ ቡድን",
-    "ቪአይፒ ይቀላቀሉ",
-    "ሲግናል ለማግኘት",
+    "ሲግናል እሸጣለሁ", "ሲግናል እልካለሁ", "ሲግናል ይግዙ",
+    "ሲግናል ይጠቀሙ", "ሲግናል ቡድን", "ዲኤም አድርጉ",
+    "ዲኤም አድርጉኝ", "ለሲግናል ዲኤም", "ቪአይፒ ቡድን",
+    "ቪአይፒ ይቀላቀሉ", "ሲግናል ለማግኘት",
 
     # ── AMHARIC: Recruitment / invite ─────────────────────────────────────
-    "ቡድኑን ይቀላቀሉ",
-    "ቻናሉን ይቀላቀሉ",
-    "ሊንኩን ይጫኑ",
-    "ሊንክ ይጠቀሙ",
-    "ሪፈራል ሊንክ",
-    "ሊንኬን ተጠቀሙ",
-    "ቻናሌን ተቀላቀሉ",
-    "ቡድኔን ተቀላቀሉ",
-    "ሊንኩን ተጫኑ",
+    "ቡድኑን ይቀላቀሉ", "ቻናሉን ይቀላቀሉ", "ሊንኩን ይጫኑ",
+    "ሊንክ ይጠቀሙ", "ሪፈራል ሊንክ", "ሊንኬን ተጠቀሙ",
+    "ቻናሌን ተቀላቀሉ", "ቡድኔን ተቀላቀሉ", "ሊንኩን ተጫኑ",
 
     # ── AMHARIC: Scam / guaranteed profit ─────────────────────────────────
-    "ትርፍ እናረጋግጣለን",
-    "ትርፍ ዋስትና",
-    "መቶ ፐርሰንት ትርፍ",
-    "ኪሳራ የለም",
-    "ገንዘብ ይላኩ",
-    "ዩኤስዲቲ ይላኩ",
-    "ቢቲሲ ይላኩ",
-    "ሂሳብዎን ያስተዳድሩ",
-    "ሂሳብ ያስተዳድራለሁ",
-    "ኢንቨስት ያድርጉ",
-    "ኢንቨስትመንት",
-    "ትርፍ ያግኙ",
-    "ዕለታዊ ትርፍ",
-    "ገንዘብ ያስቀምጡ",
-    "ፈጣን ትርፍ",
-    "ሀብት ይሁኑ",
+    "ትርፍ እናረጋግጣለን", "ትርፍ ዋስትና", "መቶ ፐርሰንት ትርፍ",
+    "ኪሳራ የለም", "ገንዘብ ይላኩ", "ዩኤስዲቲ ይላኩ",
+    "ቢቲሲ ይላኩ", "ሂሳብዎን ያስተዳድሩ", "ሂሳብ ያስተዳድራለሁ",
+    "ኢንቨስት ያድርጉ", "ኢንቨስትመንት", "ትርፍ ያግኙ",
+    "ዕለታዊ ትርፍ", "ገንዘብ ያስቀምጡ", "ፈጣን ትርፍ", "ሀብት ይሁኑ",
 
     # ── AMHARIC: Account selling ───────────────────────────────────────────
-    "አካውንት ይሸጣል",
-    "አካውንት እሸጣለሁ",
-    "አካውንት ለሽያጭ",
-    "ሮቦት ለሽያጭ",
-    "ኢኤ ለሽያጭ",
+    "አካውንት ይሸጣል", "አካውንት እሸጣለሁ", "አካውንት ለሽያጭ",
+    "ሮቦት ለሽያጭ", "ኢኤ ለሽያጭ",
 
     # ── AMHARIC: Contact solicitation ─────────────────────────────────────
-    "ዋትሳፕ ያግኙኝ",
-    "ቴሌግራም ያግኙኝ",
-    "ያናግሩኝ",
-    "መልዕክት ይላኩልኝ",
+    "ዋትሳፕ ያግኙኝ", "ቴሌግራም ያግኙኝ", "ያናግሩኝ", "መልዕክት ይላኩልኝ",
 
     # ── AMHARIC: Personal insults ─────────────────────────────────────────
-    "ደደብ ነህ",
-    "ደደብ ነሽ",
-    "ሞኝ ነህ",
-    "ሞኝ ነሽ",
-    "ዝምበል",
-    "ውሻ",
-    "አህያ",
-    "ጅል ነህ",
-    "ጅል ነሽ",
-    "ከንቱ",
-    "ጊዜ ሌባ",
-    "ፋይዳ የለህም",
-    "ፋይዳ የለሽም",
+    "ደደብ ነህ", "ደደብ ነሽ", "ሞኝ ነህ", "ሞኝ ነሽ",
+    "ዝምበል", "ውሻ", "አህያ", "ጅል ነህ", "ጅል ነሽ",
+    "ከንቱ", "ጊዜ ሌባ", "ፋይዳ የለህም", "ፋይዳ የለሽም",
 ]
 
-# ─── Gemini Rate Limiter + Queue ─────────────────────────────────────────────
-# Limits Gemini to max 10 requests/minute per key (safe under free tier 15 RPM)
-# Messages queue up and are processed one at a time — keyword filter is unaffected
+# ─── Suspicious patterns that trigger Gemini ──────────────────────────────────
+# Only messages matching these patterns get sent to Gemini.
+# Pure Forex talk (numbers, symbols, indicators) never triggers Gemini.
 
-GEMINI_RPM_LIMIT   = 10          # max requests per minute (conservative)
-GEMINI_MIN_GAP     = 60 / GEMINI_RPM_LIMIT  # seconds between requests = 6s
-SKIP_SHORT_WORDS   = 4           # skip Gemini for messages under this many words
+SUSPICIOUS_PATTERNS = [
+    # URLs / links
+    r"https?://",
+    r"t\.me/",
+    r"bit\.ly",
+    r"wa\.me",
+    # Money / wallets
+    r"\b(usdt|btc|eth|crypto|wallet|deposit|withdraw)\b",
+    r"\b(profit|income|earn|money|invest|fund)\b",
+    # Promotion signals
+    r"\b(vip|premium|paid|sell|buy|hire|promo|referral)\b",
+    r"\b(channel|group|subscribe|follow|contact|whatsapp)\b",
+    # Amharic suspicious
+    r"(ትርፍ|ገንዘብ|ሲግናል|ቡድን|ቻናል|ሊንክ|ኢንቨስት|አካውንት)",
+]
+_suspicious_re = re.compile(
+    "|".join(SUSPICIOUS_PATTERNS), re.IGNORECASE
+)
+
+# ─── Gemini Queue — 1 request per 10 seconds (6 RPM, very conservative) ───────
+GEMINI_CALL_GAP  = 10   # seconds between Gemini calls
+MIN_WORDS_GEMINI = 5    # messages under 5 words never go to Gemini
 
 _gemini_queue: asyncio.Queue = asyncio.Queue()
 _last_gemini_call: float = 0.0
 
 
 async def gemini_queue_worker():
-    """
-    Background worker that processes Gemini requests one at a time
-    with a minimum gap between calls to respect RPM limits.
-    """
+    """Single background worker — processes Gemini one at a time with gap."""
     global _last_gemini_call
     while True:
         text, future = await _gemini_queue.get()
         try:
-            # Enforce minimum gap between requests
             now = asyncio.get_event_loop().time()
-            gap = GEMINI_MIN_GAP - (now - _last_gemini_call)
+            gap = GEMINI_CALL_GAP - (now - _last_gemini_call)
             if gap > 0:
                 await asyncio.sleep(gap)
-
-            result = await analyse_with_gemini(text)
+            result = await _call_gemini(text)
             _last_gemini_call = asyncio.get_event_loop().time()
-            future.set_result(result)
+            if not future.done():
+                future.set_result(result)
         except Exception as exc:
-            future.set_exception(exc)
+            if not future.done():
+                future.set_exception(exc)
         finally:
             _gemini_queue.task_done()
 
 
+def should_use_gemini(text: str) -> bool:
+    """
+    Only send to Gemini if:
+    1. Message is long enough (>= MIN_WORDS_GEMINI words)
+    2. Message contains a suspicious pattern
+    Pure Forex analysis talk is never sent to Gemini — saves 80%+ of quota.
+    """
+    words = len(text.strip().split())
+    if words < MIN_WORDS_GEMINI:
+        return False
+    return bool(_suspicious_re.search(text))
+
+
 async def queue_gemini_analysis(text: str) -> dict:
-    """
-    Submit a message to the Gemini queue and wait for result.
-    Short messages (under SKIP_SHORT_WORDS words) are skipped entirely.
-    """
-    word_count = len(text.strip().split())
-    if word_count < SKIP_SHORT_WORDS:
-        log.info("⏭️ Skipping Gemini for short message (%s words)", word_count)
-        return {"verdict": "ALLOWED", "reason": "Short message skipped."}
+    """Submit to queue, wait for result. Returns ALLOWED if skipped or on error."""
+    if not should_use_gemini(text):
+        log.info("⏭️ Skipping Gemini (no suspicious pattern or too short)")
+        return {"verdict": "ALLOWED", "reason": "Skipped — no suspicious content."}
 
     loop = asyncio.get_event_loop()
     future = loop.create_future()
     await _gemini_queue.put((text, future))
     log.info("📥 Queued for Gemini (queue size: %s)", _gemini_queue.qsize())
     try:
-        return await asyncio.wait_for(future, timeout=180)  # 3 min max wait
+        return await asyncio.wait_for(asyncio.shield(future), timeout=300)
     except asyncio.TimeoutError:
         log.warning("⏰ Gemini queue timeout — defaulting ALLOWED")
-        return {"verdict": "ALLOWED", "reason": "Gemini timeout — safe default."}
+        return {"verdict": "ALLOWED", "reason": "Timeout — safe default."}
     except Exception as exc:
-        log.warning("⚠️ Queue error: %s — defaulting ALLOWED", exc)
-        return {"verdict": "ALLOWED", "reason": "Queue error — safe default."}
+        log.warning("⚠️ Queue error: %s", exc)
+        return {"verdict": "ALLOWED", "reason": "Error — safe default."}
 
-
-# ─── Warning Helpers ──────────────────────────────────────────────────────────
-
-def get_warning_count(user_id: int) -> int:
-    return warnings_db.get(user_id, {}).get("count", 0)
-
-
-def record_violation(user_id: int, username: str, full_name: str, reason: str):
-    if user_id in warnings_db:
-        warnings_db[user_id]["count"] += 1
-        warnings_db[user_id]["last_reason"] = reason
-    else:
-        warnings_db[user_id] = {
-            "count": 1,
-            "username": username,
-            "full_name": full_name,
-            "last_reason": reason,
-        }
-    log.info("📋 User %s → %s warning(s)", user_id, warnings_db[user_id]["count"])
-
-# ─── Keyword Filter ───────────────────────────────────────────────────────────
-
-def keyword_is_banned(text: str):
-    lower = text.lower()
-    for word in banned_words:
-        if word.lower() in lower:
-            return word
-    return None
-
-# ─── Gemini Analysis ──────────────────────────────────────────────────────────
+# ─── Gemini Core Call (with key rotation + retry) ─────────────────────────────
 
 SYSTEM_PROMPT = """You are the AI moderation engine for a professional Forex trading Telegram group.
 
 Members write in BOTH English AND Amharic (አማርኛ). Analyse both languages equally.
 
 ✅ ALWAYS ALLOW:
-- Forex, crypto, currency pairs (EUR/USD, XAU/USD, GBP/JPY, indices, commodities)
-- Trade ideas, entries/exits, stop loss, take profit, signals discussion
-- Technical analysis: indicators, chart patterns, support/resistance, candlesticks
+- Forex/crypto trading: currency pairs, trade ideas, entries, exits, SL/TP
+- Technical analysis: indicators, chart patterns, support/resistance
 - Fundamental analysis: NFP, CPI, interest rates, central bank news
 - Broker/platform talk: MT4, MT5, TradingView, cTrader
 - Risk management, lot size, leverage, drawdown
 - Market commentary, economic news in English or Amharic
-- Educational content, trading psychology
-- Friendly member conversation
+- Educational content, trading psychology, friendly conversation
 - P&L sharing, trade screenshots
 
 ❌ PROHIBITED (English or Amharic):
-1. Paid signal ads: "DM for signals", "join my VIP", "ሲግናል እሸጣለሁ"
-2. Scams: "guaranteed profit", "ትርፍ እናረጋግጣለን", wallet addresses for deposits
-3. Recruiting to other channels or groups
-4. Referral or affiliate links
-5. Personal insults or hate speech
-6. Completely off-topic spam
+1. Paid signal ads or VIP group recruitment
+2. Scams: guaranteed profit, wallet deposit requests, managed accounts
+3. Recruiting to other channels/groups, referral links
+4. Personal insults or hate speech
+5. Completely off-topic spam/advertising
 
 RULES:
-- When in doubt → ALLOWED
+- When in doubt → ALWAYS choose ALLOWED
 - Missing a scam is better than banning a real trader
 
 Respond ONLY with valid JSON, no markdown:
 {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence in English"}"""
 
 
-async def analyse_with_gemini(text: str) -> dict:
+async def _call_gemini(text: str) -> dict:
     """
-    Sends message to Gemini with key rotation + retry on 429 quota errors.
-    Tries every available key before giving up.
-    Always fails SAFE -> ALLOWED.
+    Direct Gemini call with key rotation + retry on 429.
+    Called only by the queue worker.
     """
     prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
     keys_tried = 0
     total_keys = len(GEMINI_KEYS)
 
-    while keys_tried < total_keys:
+    while True:
         try:
             model = get_gemini_model()
             response = await asyncio.to_thread(model.generate_content, prompt)
@@ -373,30 +275,51 @@ async def analyse_with_gemini(text: str) -> dict:
 
         except Exception as exc:
             err_str = str(exc)
-
-            # 429 quota exceeded — rotate key and retry
             if "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
-                log.warning("⚠️ Gemini key #%s quota exceeded. Rotating...", _current_key_index + 1)
                 keys_tried += 1
-                rotated = rotate_key()
+                log.warning("⚠️ Gemini key #%s quota exceeded (%s/%s keys tried)",
+                            _current_key_index + 1, keys_tried, total_keys)
+                rotate_key()
 
-                if not rotated or keys_tried >= total_keys:
-                    # All keys exhausted — wait for retry_delay if mentioned in error
-                    retry_wait = 60  # default
-                    match = re.search(r"retry.*?(\d+)", err_str, re.IGNORECASE)
-                    if match:
-                        retry_wait = min(int(match.group(1)), 120)  # cap at 2 min
-                    log.warning("⏳ All %s Gemini key(s) exhausted. Waiting %ss then retrying...", total_keys, retry_wait)
+                if keys_tried >= total_keys:
+                    # All keys exhausted — extract wait time from error
+                    retry_wait = 60
+                    m = re.search(r'"seconds":\s*(\d+)', err_str)
+                    if m:
+                        retry_wait = min(int(m.group(1)) + 5, 120)
+                    log.warning("⏳ All %s key(s) exhausted. Waiting %ss...", total_keys, retry_wait)
                     await asyncio.sleep(retry_wait)
-                    keys_tried = 0  # reset and try all keys once more after wait
+                    keys_tried = 0  # reset and try again after wait
                 continue
 
-            # Other error (network, parse, etc.) — log and fail safe
-            log.warning("⚠️ Gemini error: %s", exc)
+            log.warning("⚠️ Gemini non-quota error: %s", exc)
             return {"verdict": "ALLOWED", "reason": "Gemini error — safe default."}
 
-    log.warning("⚠️ All Gemini keys failed — defaulting ALLOWED")
-    return {"verdict": "ALLOWED", "reason": "All Gemini keys exhausted — keyword filter still active."}
+# ─── Warning Helpers ──────────────────────────────────────────────────────────
+
+def get_warning_count(user_id: int) -> int:
+    return warnings_db.get(user_id, {}).get("count", 0)
+
+
+def record_violation(user_id: int, username: str, full_name: str, reason: str):
+    if user_id in warnings_db:
+        warnings_db[user_id]["count"] += 1
+        warnings_db[user_id]["last_reason"] = reason
+    else:
+        warnings_db[user_id] = {
+            "count": 1, "username": username,
+            "full_name": full_name, "last_reason": reason,
+        }
+    log.info("📋 User %s → %s warning(s)", user_id, warnings_db[user_id]["count"])
+
+# ─── Keyword Filter ───────────────────────────────────────────────────────────
+
+def keyword_is_banned(text: str):
+    lower = text.lower()
+    for word in banned_words:
+        if word.lower() in lower:
+            return word
+    return None
 
 # ─── Moderation Actions ───────────────────────────────────────────────────────
 
@@ -422,12 +345,7 @@ async def ban_user(chat_id: int, user_id: int):
 
 async def send_warning(event, reason: str, user_id: int, username: str, full_name: str):
     try:
-        # Mention user by @username or inline mention if no username
-        if username:
-            mention = f"@{username}"
-        else:
-            mention = f"[{full_name}](tg://user?id={user_id})"
-
+        mention = f"@{username}" if username else f"[{full_name}](tg://user?id={user_id})"
         warning_msg = await event.respond(
             f"⚠️ **Warning / ማስጠንቀቂያ** — {mention}\n\n"
             f"🇬🇧 This is your **only warning**. Next violation = immediate ban.\n"
@@ -440,10 +358,8 @@ async def send_warning(event, reason: str, user_id: int, username: str, full_nam
         async def delete_warning_later():
             await asyncio.sleep(300)
             await delete_msg(event.chat_id, warning_msg.id)
-            log.info("🗑️ Warning auto-deleted (msg_id=%s)", warning_msg.id)
 
         asyncio.create_task(delete_warning_later())
-
     except Exception as exc:
         log.warning("Warning send failed: %s", exc)
 
@@ -474,11 +390,10 @@ def make_filter_keyboard():
         [Button.inline("📋 Show All Words", b"filter_show")],
     ]
 
-# ─── Admin Commands (private DM only) ────────────────────────────────────────
+# ─── Admin Commands ───────────────────────────────────────────────────────────
 
 @client.on(events.NewMessage(pattern="/start"))
 async def cmd_start(event):
-    # Only respond to admin in private
     if event.sender_id != ADMIN_ID or event.is_group:
         return
     await event.reply(
@@ -486,34 +401,31 @@ async def cmd_start(event):
         "**Commands:**\n"
         "/filter — Manage banned keywords\n\n"
         "**How it works:**\n"
-        "1️⃣ Every message checked against your keyword list\n"
-        "2️⃣ If no keyword match → Gemini AI analyses it\n"
-        "3️⃣ Violation → message deleted\n"
-        "4️⃣ 1st offence → public warning in group\n"
-        "5️⃣ 2nd offence → ban + private report to you\n\n"
-        "✅ Supports English & Amharic"
+        "1️⃣ Every message checked against keyword list (instant)\n"
+        "2️⃣ Suspicious messages → Gemini AI queue\n"
+        "3️⃣ Pure Forex talk → skipped (saves quota)\n"
+        "4️⃣ Violation → message deleted\n"
+        "5️⃣ 1st offence → warning (deleted after 5min)\n"
+        "6️⃣ 2nd offence → ban + private report\n\n"
+        "✅ English & Amharic | 🔄 Multi-key rotation"
     )
 
 
 @client.on(events.NewMessage(pattern="/filter"))
 async def cmd_filter(event):
-    # Only respond to admin in private
     if event.sender_id != ADMIN_ID or event.is_group:
         return
-    count = len(banned_words)
     await event.reply(
         f"🔧 **Keyword Filter Panel**\n\n"
-        f"Currently **{count}** banned word(s).\n"
-        f"Bot deletes any message containing these words instantly.\n\n"
+        f"Currently **{len(banned_words)}** banned word(s).\n"
         f"Choose an action:",
         buttons=make_filter_keyboard()
     )
 
-# ─── Callback Query Handler (NO from_users — check manually inside) ───────────
+# ─── Callback Query Handler ───────────────────────────────────────────────────
 
 @client.on(events.CallbackQuery)
 async def callback_handler(event):
-    # Only admin can use buttons
     if event.sender_id != ADMIN_ID:
         await event.answer("⛔ Admin only.", alert=True)
         return
@@ -524,7 +436,7 @@ async def callback_handler(event):
         admin_state[ADMIN_ID] = "awaiting_add"
         await event.edit(
             "➕ **Add Banned Word**\n\n"
-            "Send me the word or phrase you want to ban.\n"
+            "Send me the word or phrase to ban.\n"
             "Example: `dm me` or `guaranteed profit` or `ሲግናል`",
             buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
         )
@@ -537,8 +449,8 @@ async def callback_handler(event):
         word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(banned_words))
         await event.edit(
             f"➖ **Remove Banned Word**\n\n"
-            f"Current banned words:\n{word_list}\n\n"
-            f"Send me the exact word to remove:",
+            f"Current words:\n{word_list}\n\n"
+            f"Send the exact word to remove:",
             buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
         )
 
@@ -554,26 +466,19 @@ async def callback_handler(event):
 
     elif data == b"filter_cancel":
         admin_state.pop(ADMIN_ID, None)
-        count = len(banned_words)
         await event.edit(
-            f"✅ Cancelled.\n\n"
-            f"🔧 **Keyword Filter Panel**\n"
-            f"Currently **{count}** banned word(s).",
+            f"✅ Cancelled.\n\n🔧 **Filter Panel** — {len(banned_words)} word(s)",
             buttons=make_filter_keyboard()
         )
 
-# ─── Admin Text Handler (for add/remove input) ────────────────────────────────
+# ─── Admin Text Handler ───────────────────────────────────────────────────────
 
 @client.on(events.NewMessage)
 async def admin_text_handler(event):
-    # Only in private DM with admin, not a command, and admin is in a state
-    if event.sender_id != ADMIN_ID:
-        return
-    if event.is_group:
+    if event.sender_id != ADMIN_ID or event.is_group:
         return
     if event.text and event.text.startswith("/"):
         return
-
     state = admin_state.get(ADMIN_ID)
     if not state:
         return
@@ -585,34 +490,27 @@ async def admin_text_handler(event):
     if state == "awaiting_add":
         admin_state.pop(ADMIN_ID, None)
         if word in banned_words:
-            await event.reply(
-                f"⚠️ `{word}` is already in the filter list.",
-                buttons=make_filter_keyboard()
-            )
+            await event.reply(f"⚠️ `{word}` already in filter.", buttons=make_filter_keyboard())
         else:
             banned_words.append(word)
             await event.reply(
-                f"✅ **Added:** `{word}`\n"
-                f"Total banned words: **{len(banned_words)}**",
+                f"✅ **Added:** `{word}`\nTotal: **{len(banned_words)}**",
                 buttons=make_filter_keyboard()
             )
-        log.info("🔧 Admin added banned word: '%s'", word)
+        log.info("🔧 Admin added: '%s'", word)
 
     elif state == "awaiting_remove":
         admin_state.pop(ADMIN_ID, None)
         if word in banned_words:
             banned_words.remove(word)
             await event.reply(
-                f"✅ **Removed:** `{word}`\n"
-                f"Total banned words: **{len(banned_words)}**",
+                f"✅ **Removed:** `{word}`\nTotal: **{len(banned_words)}**",
                 buttons=make_filter_keyboard()
             )
-            log.info("🔧 Admin removed banned word: '%s'", word)
+            log.info("🔧 Admin removed: '%s'", word)
         else:
-            word_list = ", ".join(f"`{w}`" for w in banned_words) or "none"
             await event.reply(
-                f"❌ `{word}` not found in filter.\n\n"
-                f"Current words: {word_list}",
+                f"❌ `{word}` not found in filter.",
                 buttons=make_filter_keyboard()
             )
 
@@ -639,16 +537,17 @@ async def handle_group_message(event):
 
     log.info("📨 [%s | %s]: %s", full_name, user_id, message_text[:80])
 
-    # ── Layer 1: keyword filter (instant) ─────────────────────────────────
+    # ── Layer 1: Keyword filter — instant, no API ──────────────────────────
     matched_word = keyword_is_banned(message_text)
     if matched_word:
         violation_reason = f"Message contains banned word: '{matched_word}'"
         log.info("🚫 Keyword hit: '%s'", matched_word)
+
     else:
-        # ── Layer 2: Gemini AI ─────────────────────────────────────────────
+        # ── Layer 2: Smart Gemini — only suspicious messages ───────────────
         result = await queue_gemini_analysis(message_text)
         if result["verdict"] != "PROHIBITED":
-            return  # clean — stay silent
+            return  # clean — stay completely silent
         violation_reason = result["reason"]
 
     # ── Act on violation ──────────────────────────────────────────────────
@@ -662,10 +561,7 @@ async def handle_group_message(event):
     else:
         record_violation(user_id, username, full_name, violation_reason)
         await ban_user(chat_id, user_id)
-        await notify_admin(
-            user_id, username, full_name,
-            message_text, violation_reason, "🔨 BANNED"
-        )
+        await notify_admin(user_id, username, full_name, message_text, violation_reason, "🔨 BANNED")
         log.info("🔨 Banned %s (%s)", full_name, user_id)
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -681,11 +577,10 @@ async def main():
     except Exception as exc:
         log.error("❌ Cannot access group %s: %s", GROUP_ID, exc)
 
-    # Start Gemini queue worker
     asyncio.create_task(gemini_queue_worker())
-    log.info("📡 Gemini: gemini-2.0-flash | RPM limit: %s req/min | Queue: active", GEMINI_RPM_LIMIT)
-    log.info("⏭️ Short messages under %s words skip Gemini", SKIP_SHORT_WORDS)
-    log.info("👤 Admin: %s", ADMIN_ID)
+    log.info("📡 Gemini: gemini-2.0-flash | %s key(s) | Gap: %ss | Smart filter: ON",
+             len(GEMINI_KEYS), GEMINI_CALL_GAP)
+    log.info("👤 Admin: %s | /filter to manage keywords", ADMIN_ID)
     await client.run_until_disconnected()
 
 
