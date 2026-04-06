@@ -1,12 +1,10 @@
 """
 Forex Group Management Bot — Dual Client (Bot + Userbot)
 ─────────────────────────────────────────────────────────
-Bot Client   : Admin UI, warnings, ban, filter panel
-Userbot      : Deletes messages from a specific bot (or all bots)
-Gemini AI    : Smart analysis with key rotation + queue
-Keyword Filter: Pre-loaded English + Amharic banned words
-Persistent warnings (SQLite)
-Railway deployment
+- Bot client: Keyword filter + Gemini AI for ALL messages (except admin/userbot)
+- Userbot:   ONLY deletes messages from a specific target bot (ads)
+- Persistent warnings (SQLite)
+- No extra deletions by userbot (no links, mentions, other bots)
 """
 
 import os
@@ -43,10 +41,9 @@ BOT_TOKEN  = os.environ["BOT_TOKEN"]
 ADMIN_ID   = int(os.environ["ADMIN_ID"])
 GROUP_ID   = int(os.environ["GROUP_ID"])
 
-# ─── Target Bot (delete all its messages, even if admin) ──────────────────────
+# ─── Target Bot (userbot will delete EVERY message from this bot) ─────────────
 TARGET_BOT_USERNAME = os.environ.get("TARGET_BOT_USERNAME")  # without @
 TARGET_BOT_ID = int(os.environ["TARGET_BOT_ID"]) if os.environ.get("TARGET_BOT_ID") else None
-DELETE_ALL_BOTS = os.environ.get("DELETE_ALL_BOTS", "false").lower() == "true"
 
 # ─── Gemini Setup — Key Rotation ──────────────────────────────────────────────
 _raw_keys   = os.environ["GEMINI_API_KEY"]
@@ -218,19 +215,15 @@ def should_use_gemini(text: str) -> bool:
 
 async def queue_gemini_analysis(text: str) -> dict:
     if not should_use_gemini(text):
-        log.info("⏭️ Skipping Gemini (no suspicious pattern or too short)")
         return {"verdict": "ALLOWED", "reason": "Skipped."}
     loop = asyncio.get_event_loop()
     future = loop.create_future()
     await _gemini_queue.put((text, future))
-    log.info("📥 Queued for Gemini (size: %s)", _gemini_queue.qsize())
     try:
         return await asyncio.wait_for(asyncio.shield(future), timeout=300)
     except asyncio.TimeoutError:
-        log.warning("⏰ Gemini timeout — ALLOWED")
         return {"verdict": "ALLOWED", "reason": "Timeout."}
-    except Exception as exc:
-        log.warning("⚠️ Queue error: %s", exc)
+    except Exception:
         return {"verdict": "ALLOWED", "reason": "Error."}
 
 SYSTEM_PROMPT = """You are the AI moderation engine for a professional Forex trading Telegram group.
@@ -274,34 +267,29 @@ async def _call_gemini(text: str) -> dict:
             err_str = str(exc)
             if "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
                 keys_tried += 1
-                log.warning("⚠️ Key #%s quota exceeded (%s/%s tried)", _current_key_index + 1, keys_tried, total_keys)
                 rotate_key()
                 if keys_tried >= total_keys:
                     retry_wait = 60
                     m = re.search(r'"seconds":\s*(\d+)', err_str)
                     if m:
                         retry_wait = min(int(m.group(1)) + 5, 120)
-                    log.warning("⏳ All keys exhausted. Waiting %ss...", retry_wait)
                     await asyncio.sleep(retry_wait)
                     keys_tried = 0
                 continue
-            log.warning("⚠️ Gemini error: %s", exc)
-            return {"verdict": "ALLOWED", "reason": "Gemini error — safe default."}
+            return {"verdict": "ALLOWED", "reason": "Gemini error."}
 
-# ─── Warning / Ban Helpers ────────────────────────────────────────────────────
+# ─── Helper Functions ─────────────────────────────────────────────────────────
 async def delete_msg(chat_id: int, message_id: int):
     if userbot_connected:
         try:
             await user_client.delete_messages(chat_id, message_id)
-            log.info("🗑️ [USERBOT] Deleted msg %s", message_id)
             return
-        except Exception as exc:
-            log.warning("Userbot delete failed, trying bot: %s", exc)
+        except Exception:
+            pass
     try:
         await bot_client.delete_messages(chat_id, message_id)
-        log.info("🗑️ [BOT] Deleted msg %s", message_id)
-    except Exception as exc:
-        log.warning("Bot delete also failed: %s", exc)
+    except Exception:
+        pass
 
 async def ban_user(chat_id: int, user_id: int):
     try:
@@ -310,9 +298,8 @@ async def ban_user(chat_id: int, user_id: int):
             participant=user_id,
             banned_rights=ChatBannedRights(until_date=None, view_messages=True)
         ))
-        log.info("🔨 Banned user %s", user_id)
-    except Exception as exc:
-        log.error("Ban failed for %s: %s", user_id, exc)
+    except Exception as e:
+        log.error(f"Ban failed: {e}")
 
 async def send_warning(event, reason: str, user_id: int, username: str, full_name: str):
     try:
@@ -325,13 +312,12 @@ async def send_warning(event, reason: str, user_id: int, username: str, full_nam
             f"📋 **Reason:** {reason}",
             parse_mode="md"
         )
-        log.info("⚠️ Warning sent to %s, auto-delete in 5min", user_id)
         async def delete_warning_later():
             await asyncio.sleep(300)
             await delete_msg(event.chat_id, warning_msg.id)
         asyncio.create_task(delete_warning_later())
-    except Exception as exc:
-        log.warning("Warning send failed: %s", exc)
+    except Exception:
+        pass
 
 async def notify_admin(user_id, username, full_name, text, reason, action):
     try:
@@ -347,8 +333,8 @@ async def notify_admin(user_id, username, full_name, text, reason, action):
             f"**Time:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
         await bot_client.send_message(ADMIN_ID, msg, parse_mode="md")
-    except Exception as exc:
-        log.error("Admin notify failed: %s", exc)
+    except Exception:
+        pass
 
 def keyword_is_banned(text: str):
     lower = text.lower()
@@ -365,7 +351,7 @@ def make_filter_keyboard():
     ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOT CLIENT HANDLERS
+# BOT CLIENT HANDLERS (Admin commands)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot_client.on(events.NewMessage(pattern="/start"))
@@ -382,7 +368,7 @@ async def cmd_start(event):
         "**How it works:**\n"
         "1️⃣ Keyword filter — instant, no API\n"
         "2️⃣ Suspicious messages → Gemini AI queue\n"
-        "3️⃣ Userbot deletes messages from target bot & others\n"
+        "3️⃣ Userbot deletes ONLY the target bot's messages\n"
         "4️⃣ 1st offence → warning (deleted after 5min)\n"
         "5️⃣ 2nd offence → permanent ban + private report\n\n"
         "✅ English & Amharic | 🔄 Multi-key Gemini rotation"
@@ -393,9 +379,7 @@ async def cmd_filter(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
     await event.reply(
-        f"🔧 **Keyword Filter Panel**\n\n"
-        f"Currently **{len(banned_words)}** banned word(s).\n"
-        f"Choose an action:",
+        f"🔧 **Keyword Filter Panel**\n\nCurrently **{len(banned_words)}** banned word(s).",
         buttons=make_filter_keyboard()
     )
 
@@ -405,7 +389,7 @@ async def cmd_connect(event):
         return
     global userbot_connected
     if userbot_connected:
-        await event.reply("✅ Userbot is already connected and active!")
+        await event.reply("✅ Userbot already connected.")
         return
     session_file = USER_SESSION + ".session" if not USER_SESSION.endswith(".session") else USER_SESSION
     if os.path.exists(session_file):
@@ -415,20 +399,12 @@ async def cmd_connect(event):
             if await user_client.is_user_authorized():
                 userbot_connected = True
                 me = await user_client.get_me()
-                await event.reply(
-                    f"✅ **Userbot reconnected!**\n"
-                    f"👤 Logged in as: **{me.first_name}** (@{me.username or 'no username'})"
-                )
-                log.info("✅ Userbot reconnected from saved session: %s", me.first_name)
+                await event.reply(f"✅ Userbot reconnected as {me.first_name} (@{me.username or 'no username'})")
                 return
-        except Exception as exc:
-            log.warning("Session reconnect failed: %s", exc)
+        except Exception:
+            pass
     connect_state[ADMIN_ID] = {"step": "phone"}
-    await event.reply(
-        "📱 **Userbot Login**\n\n"
-        "Please send your **phone number** with country code.\n"
-        "Example: `+251912345678`"
-    )
+    await event.reply("📱 Send your phone number with country code (e.g., +251912345678)")
 
 @bot_client.on(events.NewMessage(pattern="/cancel"))
 async def cmd_cancel(event):
@@ -446,39 +422,23 @@ async def callback_handler(event):
     data = event.data
     if data == b"filter_add":
         admin_state[ADMIN_ID] = "awaiting_add"
-        await event.edit(
-            "➕ **Add Banned Word**\n\n"
-            "Send me the word or phrase to ban.\n"
-            "Example: `dm me` or `guaranteed profit` or `ሲግናል`",
-            buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
-        )
+        await event.edit("➕ Send the word/phrase to ban.", buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]])
     elif data == b"filter_remove":
         if not banned_words:
-            await event.answer("No words in filter yet!", alert=True)
+            await event.answer("No words in filter!", alert=True)
             return
         admin_state[ADMIN_ID] = "awaiting_remove"
         word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(banned_words))
-        await event.edit(
-            f"➖ **Remove Banned Word**\n\n"
-            f"Current words:\n{word_list}\n\n"
-            f"Send the exact word to remove:",
-            buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
-        )
+        await event.edit(f"➖ Current words:\n{word_list}\n\nSend the exact word to remove:", buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]])
     elif data == b"filter_show":
         if not banned_words:
             await event.answer("Filter list is empty!", alert=True)
             return
         word_list = "\n".join(f"• `{w}`" for w in banned_words)
-        await event.edit(
-            f"📋 **Banned Words ({len(banned_words)} total)**\n\n{word_list}",
-            buttons=make_filter_keyboard()
-        )
+        await event.edit(f"📋 Banned Words ({len(banned_words)} total)\n\n{word_list}", buttons=make_filter_keyboard())
     elif data == b"filter_cancel":
         admin_state.pop(ADMIN_ID, None)
-        await event.edit(
-            f"✅ Cancelled. — {len(banned_words)} word(s) active",
-            buttons=make_filter_keyboard()
-        )
+        await event.edit(f"✅ Cancelled. — {len(banned_words)} word(s) active", buttons=make_filter_keyboard())
 
 @bot_client.on(events.NewMessage)
 async def admin_private_handler(event):
@@ -489,6 +449,7 @@ async def admin_private_handler(event):
     text = (event.raw_text or "").strip()
     if not text:
         return
+    # /connect flow
     conn = connect_state.get(ADMIN_ID)
     if conn:
         step = conn.get("step")
@@ -500,17 +461,13 @@ async def admin_private_handler(event):
                 result = await user_client.send_code_request(phone)
                 conn["phone_code_hash"] = result.phone_code_hash
                 conn["step"] = "code"
-                await event.reply(
-                    "📩 **OTP sent to your Telegram!**\n\n"
-                    "Please send the **verification code**.\n"
-                    "If you received `12345`, send it as `1 2 3 4 5` (with spaces)."
-                )
+                await event.reply("📩 Code sent. Send it with spaces (e.g., 1 2 3 4 5)")
             except FloodWaitError as e:
                 connect_state.pop(ADMIN_ID, None)
-                await event.reply(f"⚠️ Flood wait: try again in {e.seconds} seconds.")
-            except Exception as exc:
+                await event.reply(f"⚠️ Flood wait {e.seconds}s")
+            except Exception as e:
                 connect_state.pop(ADMIN_ID, None)
-                await event.reply(f"❌ Failed to send code: {exc}")
+                await event.reply(f"❌ {e}")
             return
         if step == "code":
             code = text.replace(" ", "")
@@ -522,20 +479,15 @@ async def admin_private_handler(event):
                 global userbot_connected
                 userbot_connected = True
                 me = await user_client.get_me()
-                await event.reply(
-                    f"✅ **Userbot connected!**\n"
-                    f"👤 Logged in as: **{me.first_name}** (@{me.username or 'no username'})\n\n"
-                    f"The userbot will now delete messages from the target bot, links, etc."
-                )
-                log.info("✅ Userbot logged in: %s", me.first_name)
+                await event.reply(f"✅ Userbot connected as {me.first_name} (@{me.username or 'no username'})")
             except SessionPasswordNeededError:
                 conn["step"] = "password"
-                await event.reply("🔐 **2FA enabled.** Please send your password:")
+                await event.reply("🔐 2FA enabled. Send your password:")
             except PhoneCodeInvalidError:
                 await event.reply("❌ Wrong code. Use /connect to restart.")
-            except Exception as exc:
+            except Exception as e:
                 connect_state.pop(ADMIN_ID, None)
-                await event.reply(f"❌ Login failed: {exc}")
+                await event.reply(f"❌ {e}")
             return
         if step == "password":
             password = text
@@ -544,17 +496,11 @@ async def admin_private_handler(event):
                 connect_state.pop(ADMIN_ID, None)
                 userbot_connected = True
                 me = await user_client.get_me()
-                await event.reply(
-                    f"✅ **Userbot connected with 2FA!**\n"
-                    f"👤 Logged in as: **{me.first_name}** (@{me.username or 'no username'})"
-                )
-                log.info("✅ Userbot logged in (2FA): %s", me.first_name)
-            except PasswordHashInvalidError:
-                await event.reply("❌ Wrong 2FA password. Try again:")
-            except Exception as exc:
-                connect_state.pop(ADMIN_ID, None)
-                await event.reply(f"❌ 2FA failed: {exc}")
+                await event.reply(f"✅ Userbot connected (2FA) as {me.first_name}")
+            except Exception as e:
+                await event.reply(f"❌ Wrong password: {e}")
             return
+    # /filter flow
     state = admin_state.get(ADMIN_ID)
     if not state:
         return
@@ -565,19 +511,17 @@ async def admin_private_handler(event):
             await event.reply(f"⚠️ `{word}` already in filter.", buttons=make_filter_keyboard())
         else:
             banned_words.append(word)
-            await event.reply(f"✅ **Added:** `{word}`\nTotal: **{len(banned_words)}**", buttons=make_filter_keyboard())
-        log.info("🔧 Admin added: '%s'", word)
+            await event.reply(f"✅ Added `{word}`\nTotal: {len(banned_words)}", buttons=make_filter_keyboard())
     elif state == "awaiting_remove":
         admin_state.pop(ADMIN_ID, None)
         if word in banned_words:
             banned_words.remove(word)
-            await event.reply(f"✅ **Removed:** `{word}`\nTotal: **{len(banned_words)}**", buttons=make_filter_keyboard())
-            log.info("🔧 Admin removed: '%s'", word)
+            await event.reply(f"✅ Removed `{word}`\nTotal: {len(banned_words)}", buttons=make_filter_keyboard())
         else:
-            await event.reply(f"❌ `{word}` not found in filter.", buttons=make_filter_keyboard())
+            await event.reply(f"❌ `{word}` not found.", buttons=make_filter_keyboard())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOT CLIENT — Group Message Handler (members)
+# BOT CLIENT — Group Message Handler (keyword + Gemini for ALL messages)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
@@ -587,131 +531,90 @@ async def handle_group_message(event):
     sender = await event.get_sender()
     if sender is None:
         return
-    me = await bot_client.get_me()
-    if sender.id == me.id:
+    me_bot = await bot_client.get_me()
+    # Skip: bot itself, human admin, and the userbot account
+    if sender.id in (me_bot.id, ADMIN_ID):
         return
-    # Skip human admin
-    if sender.id == ADMIN_ID:
-        return
+    # Also skip if sender is the userbot (though userbot should never be in this handler anyway)
+    if userbot_connected:
+        me_user = await user_client.get_me()
+        if sender.id == me_user.id:
+            return
+
     message_text = event.raw_text or ""
     if not message_text.strip():
         return
-    user_id   = sender.id
-    username  = getattr(sender, "username", "") or ""
+
+    user_id = sender.id
+    username = getattr(sender, "username", "") or ""
     full_name = " ".join(filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])) or username or str(user_id)
     chat_id = event.chat_id
-    is_bot  = getattr(sender, "bot", False)
-    log.info("📨 [%s%s | %s]: %s", "🤖 " if is_bot else "", full_name, user_id, message_text[:80])
+    is_bot = getattr(sender, "bot", False)
+
+    # Check keyword filter
     matched_word = keyword_is_banned(message_text)
     if matched_word:
-        violation_reason = f"Message contains banned word: '{matched_word}'"
-        log.info("🚫 Keyword hit: '%s'", matched_word)
+        violation_reason = f"Banned word: '{matched_word}'"
+        log.info(f"🚫 Keyword hit from {full_name}: {matched_word}")
     else:
+        # Check Gemini (only if message is suspicious)
         result = await queue_gemini_analysis(message_text)
         if result["verdict"] != "PROHIBITED":
             return
         violation_reason = result["reason"]
+        log.info(f"🤖 Gemini prohibited from {full_name}: {violation_reason}")
+
+    # Delete the violating message
     await delete_msg(chat_id, event.id)
+
+    # Bots do not receive warnings or bans (just deletion)
     if is_bot:
-        log.info("🤖 Bot message deleted (no warning for bots)")
+        log.info(f"🤖 Bot message deleted (no warning for bots): {full_name}")
         return
+
+    # Apply warning/ban to human users
     prior = get_warning_count(user_id)
     if prior == 0:
         record_violation(user_id, username, full_name, violation_reason)
         await send_warning(event, violation_reason, user_id, username, full_name)
-        log.info("⚠️ Warned %s (%s)", full_name, user_id)
     else:
         record_violation(user_id, username, full_name, violation_reason)
         await ban_user(chat_id, user_id)
-        await notify_admin(user_id, username, full_name, message_text, violation_reason, "🔨 BANNED")
-        log.info("🔨 Banned %s (%s)", full_name, user_id)
+        await notify_admin(user_id, username, full_name, message_text, violation_reason, "BANNED")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# USERBOT CLIENT — Group Handler
+# USERBOT CLIENT — ONLY deletes target bot messages (nothing else)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# Patterns for link/mention deletion (for non-target bots and humans)
-_link_re    = re.compile(r"https?://|t\.me/|bit\.ly|wa\.me|tinyurl", re.IGNORECASE)
-_mention_re = re.compile(r"@[a-zA-Z0-9_]{4,}")
 
 @user_client.on(events.NewMessage(chats=GROUP_ID))
-async def userbot_group_handler(event):
+async def userbot_target_bot_deleter(event):
     if not userbot_connected:
         return
+
     sender = await event.get_sender()
     if sender is None:
         return
-    me = await user_client.get_me()
-    # Never delete our own userbot or the human admin
-    if sender.id in (me.id, ADMIN_ID):
+
+    # Never delete messages from the userbot itself or the human admin
+    me_user = await user_client.get_me()
+    if sender.id in (me_user.id, ADMIN_ID):
         return
-    message_text = event.raw_text or ""
-    chat_id = event.chat_id
-    is_bot = getattr(sender, "bot", False)
+
+    # Check if this is the target bot (by username or ID)
+    is_target = False
     username = getattr(sender, "username", "") or ""
-    full_name = " ".join(filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])) or username or str(sender.id)
-
-    # ── TARGET BOT: delete EVERY message unconditionally ──────────────────
-    target_match = False
     if TARGET_BOT_USERNAME and username.lower() == TARGET_BOT_USERNAME.lower():
-        target_match = True
+        is_target = True
     if TARGET_BOT_ID and sender.id == TARGET_BOT_ID:
-        target_match = True
+        is_target = True
 
-    if target_match:
+    if is_target:
         try:
-            await user_client.delete_messages(chat_id, event.id)
-            log.info("🎯 [USERBOT] Deleted ALL messages from target bot: %s (%s)", full_name, sender.id)
-        except Exception as exc:
-            log.warning("Userbot failed to delete target bot msg: %s", exc)
-        return  # No further processing (no warnings/ban for bots)
-
-    # ── DELETE ALL BOTS (if enabled) ──────────────────────────────────────
-    if DELETE_ALL_BOTS and is_bot:
-        try:
-            await user_client.delete_messages(chat_id, event.id)
-            log.info("🤖🗑️ [USERBOT] Deleted message from bot: %s (%s)", full_name, sender.id)
-        except Exception as exc:
-            log.warning("Userbot failed to delete bot msg: %s", exc)
-        return
-
-    # ── For humans and non-target bots: delete links and mentions ──────────
-    if message_text:
-        if _link_re.search(message_text):
-            try:
-                await user_client.delete_messages(chat_id, event.id)
-                log.info("🔗🗑️ [USERBOT] Deleted link message from %s (%s)", full_name, sender.id)
-                await _handle_userbot_violation(event, sender.id, username, full_name, chat_id,
-                                                f"Message contains a link: {message_text[:100]}")
-            except Exception as exc:
-                log.warning("Userbot failed to delete link msg: %s", exc)
-            return
-        mentions = _mention_re.findall(message_text)
-        if mentions:
-            external_mentions = [m for m in mentions if m.lower() not in
-                                 (f"@{username.lower()}", f"@{me.username.lower() if me.username else ''}")]
-            if external_mentions:
-                try:
-                    await user_client.delete_messages(chat_id, event.id)
-                    log.info("👤🗑️ [USERBOT] Deleted @mention message from %s — mentions: %s",
-                             full_name, external_mentions)
-                    await _handle_userbot_violation(event, sender.id, username, full_name, chat_id,
-                                                    f"Message contains external username mention: {', '.join(external_mentions)}")
-                except Exception as exc:
-                    log.warning("Userbot failed to delete mention msg: %s", exc)
-                return
-
-async def _handle_userbot_violation(event, user_id, username, full_name, chat_id, reason):
-    prior = get_warning_count(user_id)
-    if prior == 0:
-        record_violation(user_id, username, full_name, reason)
-        await send_warning(event, reason, user_id, username, full_name)
-        log.info("⚠️ [USERBOT] Warned %s (%s)", full_name, user_id)
-    else:
-        record_violation(user_id, username, full_name, reason)
-        await ban_user(chat_id, user_id)
-        await notify_admin(user_id, username, full_name, reason, reason, "🔨 BANNED")
-        log.info("🔨 [USERBOT] Banned %s (%s)", full_name, user_id)
+            await user_client.delete_messages(event.chat_id, event.id)
+            log.info(f"🎯 [USERBOT] Deleted target bot message from {username or sender.id}")
+        except Exception as e:
+            log.warning(f"Failed to delete target bot message: {e}")
+    # else: do absolutely nothing (no link deletion, no mention deletion, no other bot deletion)
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
@@ -719,29 +622,35 @@ async def main():
     global userbot_connected
     init_warnings_db()
     await bot_client.start(bot_token=BOT_TOKEN)
-    me = await bot_client.get_me()
-    log.info("🤖 Bot: @%s (ID: %s)", me.username, me.id)
+    log.info(f"🤖 Bot started: {(await bot_client.get_me()).username}")
+    # Try to load userbot session
     try:
         os.makedirs(os.path.dirname(USER_SESSION) if os.path.dirname(USER_SESSION) else ".", exist_ok=True)
         await user_client.connect()
         if await user_client.is_user_authorized():
             userbot_connected = True
-            ume = await user_client.get_me()
-            log.info("✅ Userbot: %s (@%s) — connected from saved session", ume.first_name, ume.username or "no username")
+            me = await user_client.get_me()
+            log.info(f"✅ Userbot loaded: {me.first_name} (@{me.username or 'no username'})")
         else:
-            log.info("⚠️ Userbot not logged in. Send /connect to your bot to log in.")
-    except Exception as exc:
-        log.warning("⚠️ Userbot connect attempt failed: %s", exc)
+            log.info("⚠️ Userbot not logged in. Send /connect to your bot.")
+    except Exception as e:
+        log.warning(f"Userbot connect failed: {e}")
+    # Verify group access
     try:
         entity = await bot_client.get_entity(GROUP_ID)
-        log.info("✅ Monitoring: %s (ID: %s)", entity.title, GROUP_ID)
-    except Exception as exc:
-        log.error("❌ Cannot access group %s: %s", GROUP_ID, exc)
+        log.info(f"✅ Monitoring: {entity.title} (ID: {GROUP_ID})")
+    except Exception as e:
+        log.error(f"Cannot access group: {e}")
     asyncio.create_task(gemini_queue_worker())
-    log.info("📡 Gemini: gemini-2.0-flash | %s key(s) | Gap: %ss", len(GEMINI_KEYS), GEMINI_CALL_GAP)
-    log.info("👤 Admin: %s | Target bot: %s", ADMIN_ID, TARGET_BOT_USERNAME or TARGET_BOT_ID or "None")
+    log.info(f"📡 Gemini: {len(GEMINI_KEYS)} key(s) | Gap: {GEMINI_CALL_GAP}s")
+    target_desc = TARGET_BOT_USERNAME or TARGET_BOT_ID or "None"
+    log.info(f"🎯 Userbot will ONLY delete messages from target bot: {target_desc}")
+    log.info(f"👤 Admin: {ADMIN_ID} | /connect to login userbot | /filter for keywords")
     if userbot_connected:
-        await asyncio.gather(bot_client.run_until_disconnected(), user_client.run_until_disconnected())
+        await asyncio.gather(
+            bot_client.run_until_disconnected(),
+            user_client.run_until_disconnected(),
+        )
     else:
         await bot_client.run_until_disconnected()
 
