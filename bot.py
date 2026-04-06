@@ -42,8 +42,171 @@ client = TelegramClient("bot_session", API_ID, API_HASH)
 
 # ─── In-Memory Stores ─────────────────────────────────────────────────────────
 warnings_db: dict = {}
-banned_words: list = []
 admin_state: dict = {}   # { ADMIN_ID: "awaiting_add" | "awaiting_remove" }
+
+# ─── Pre-loaded Banned Words (English + Amharic) ──────────────────────────────
+# Admin can add/remove more via /filter command in bot DM
+banned_words: list = [
+
+    # ── ENGLISH: Signal selling / VIP promotion ───────────────────────────
+    "dm me for signals",
+    "dm for signals",
+    "i sell signals",
+    "selling signals",
+    "join my vip",
+    "join our vip",
+    "vip signals",
+    "paid signals",
+    "premium signals",
+    "signal provider",
+    "signal service",
+    "buy signals",
+    "my signals",
+
+    # ── ENGLISH: Recruitment / invite spam ────────────────────────────────
+    "join my group",
+    "join our group",
+    "join my channel",
+    "join our channel",
+    "subscribe to my channel",
+    "click the link",
+    "link in bio",
+    "check my bio",
+    "use my referral",
+    "referral link",
+    "use my link",
+    "register with my link",
+    "deposit via my link",
+    "use my code",
+    "promo code",
+    "invite link",
+
+    # ── ENGLISH: Scam / guaranteed profit ─────────────────────────────────
+    "guaranteed profit",
+    "guaranteed return",
+    "100% profit",
+    "risk free",
+    "risk-free",
+    "no loss",
+    "double your money",
+    "i will manage your account",
+    "managed account",
+    "send me money",
+    "send usdt",
+    "send btc",
+    "invest with me",
+    "investment platform",
+    "fund your account",
+    "withdraw daily",
+    "earn daily",
+    "earn money online",
+    "make money online",
+    "passive income",
+    "financial freedom",
+
+    # ── ENGLISH: Account selling ───────────────────────────────────────────
+    "account for sale",
+    "selling account",
+    "buying account",
+    "broker account for sale",
+    "ea for sale",
+    "robot for sale",
+    "trading bot for sale",
+
+    # ── ENGLISH: Contact solicitation ─────────────────────────────────────
+    "whatsapp me",
+    "contact me on whatsapp",
+    "dm me",
+    "message me",
+    "inbox me",
+    "contact for promo",
+    "available for hire",
+    "hire me",
+    "i offer services",
+    "we offer services",
+
+    # ── ENGLISH: Personal insults ─────────────────────────────────────────
+    "you idiot",
+    "you are stupid",
+    "you are dumb",
+    "you fool",
+    "shut up",
+    "go to hell",
+    "son of a bitch",
+    "motherfucker",
+    "you loser",
+    "you are a scammer",
+
+    # ── AMHARIC: Signal selling / VIP promotion ───────────────────────────
+    "ሲግናል እሸጣለሁ",
+    "ሲግናል እልካለሁ",
+    "ሲግናል ይግዙ",
+    "ሲግናል ይጠቀሙ",
+    "ሲግናል ቡድን",
+    "ዲኤም አድርጉ",
+    "ዲኤም አድርጉኝ",
+    "ለሲግናል ዲኤም",
+    "ቪአይፒ ቡድን",
+    "ቪአይፒ ይቀላቀሉ",
+    "ሲግናል ለማግኘት",
+
+    # ── AMHARIC: Recruitment / invite ─────────────────────────────────────
+    "ቡድኑን ይቀላቀሉ",
+    "ቻናሉን ይቀላቀሉ",
+    "ሊንኩን ይጫኑ",
+    "ሊንክ ይጠቀሙ",
+    "ሪፈራል ሊንክ",
+    "ሊንኬን ተጠቀሙ",
+    "ቻናሌን ተቀላቀሉ",
+    "ቡድኔን ተቀላቀሉ",
+    "ሊንኩን ተጫኑ",
+
+    # ── AMHARIC: Scam / guaranteed profit ─────────────────────────────────
+    "ትርፍ እናረጋግጣለን",
+    "ትርፍ ዋስትና",
+    "መቶ ፐርሰንት ትርፍ",
+    "ኪሳራ የለም",
+    "ገንዘብ ይላኩ",
+    "ዩኤስዲቲ ይላኩ",
+    "ቢቲሲ ይላኩ",
+    "ሂሳብዎን ያስተዳድሩ",
+    "ሂሳብ ያስተዳድራለሁ",
+    "ኢንቨስት ያድርጉ",
+    "ኢንቨስትመንት",
+    "ትርፍ ያግኙ",
+    "ዕለታዊ ትርፍ",
+    "ገንዘብ ያስቀምጡ",
+    "ፈጣን ትርፍ",
+    "ሀብት ይሁኑ",
+
+    # ── AMHARIC: Account selling ───────────────────────────────────────────
+    "አካውንት ይሸጣል",
+    "አካውንት እሸጣለሁ",
+    "አካውንት ለሽያጭ",
+    "ሮቦት ለሽያጭ",
+    "ኢኤ ለሽያጭ",
+
+    # ── AMHARIC: Contact solicitation ─────────────────────────────────────
+    "ዋትሳፕ ያግኙኝ",
+    "ቴሌግራም ያግኙኝ",
+    "ያናግሩኝ",
+    "መልዕክት ይላኩልኝ",
+
+    # ── AMHARIC: Personal insults ─────────────────────────────────────────
+    "ደደብ ነህ",
+    "ደደብ ነሽ",
+    "ሞኝ ነህ",
+    "ሞኝ ነሽ",
+    "ዝምበል",
+    "ውሻ",
+    "አህያ",
+    "ጅል ነህ",
+    "ጅል ነሽ",
+    "ከንቱ",
+    "ጊዜ ሌባ",
+    "ፋይዳ የለህም",
+    "ፋይዳ የለሽም",
+]
 
 # ─── Warning Helpers ──────────────────────────────────────────────────────────
 
