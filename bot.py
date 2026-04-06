@@ -2,9 +2,10 @@
 Forex Group Management Bot — Dual Client (Bot + Userbot)
 ─────────────────────────────────────────────────────────
 Bot Client   : Admin UI, warnings, ban, filter panel
-Userbot      : Deletes messages from other bots, links, @ usernames
+Userbot      : Deletes messages from a specific bot (or all bots)
 Gemini AI    : Smart analysis with key rotation + queue
 Keyword Filter: Pre-loaded English + Amharic banned words
+Persistent warnings (SQLite)
 Railway deployment
 """
 
@@ -13,11 +14,13 @@ import asyncio
 import logging
 import json
 import re
+import pathlib
+import sqlite3
 from datetime import datetime
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.channels import EditBannedRequest
-from telethon.tl.types import ChatBannedRights, User
+from telethon.tl.types import ChatBannedRights
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -40,6 +43,11 @@ BOT_TOKEN  = os.environ["BOT_TOKEN"]
 ADMIN_ID   = int(os.environ["ADMIN_ID"])
 GROUP_ID   = int(os.environ["GROUP_ID"])
 
+# ─── Target Bot (delete all its messages, even if admin) ──────────────────────
+TARGET_BOT_USERNAME = os.environ.get("TARGET_BOT_USERNAME")  # without @
+TARGET_BOT_ID = int(os.environ["TARGET_BOT_ID"]) if os.environ.get("TARGET_BOT_ID") else None
+DELETE_ALL_BOTS = os.environ.get("DELETE_ALL_BOTS", "false").lower() == "true"
+
 # ─── Gemini Setup — Key Rotation ──────────────────────────────────────────────
 _raw_keys   = os.environ["GEMINI_API_KEY"]
 GEMINI_KEYS: list = [k.strip() for k in _raw_keys.split(",") if k.strip()]
@@ -60,44 +68,84 @@ def rotate_key() -> bool:
     log.info("🔄 Rotated to Gemini key #%s", _current_key_index + 1)
     return True
 
-# ─── Telethon Clients ─────────────────────────────────────────────────────────
-# Bot client  — for UI, warnings, bans, admin commands
-bot_client  = TelegramClient("bot_session",  API_ID, API_HASH)
+# ─── Helper: Ensure session directory exists ─────────────────────────────────
+def ensure_session_dir(session_path: str) -> str:
+    if not session_path:
+        session_path = "user_instance.session"
+    path = pathlib.Path(session_path)
+    parent = path.parent
+    if parent and not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+        log.info("📁 Created session directory: %s", parent)
+    return str(path)
 
-# Userbot client — for deleting bot messages, links, @ spam
-# Session saved to file so login persists across Railway restarts
-USER_SESSION = os.environ.get("USER_SESSION_PATH", "/data/user_instance.session")
-user_client  = TelegramClient(USER_SESSION, API_ID, API_HASH)
+# ─── Persistent Warnings (SQLite) ────────────────────────────────────────────
+DB_PATH = "warnings.db"
+
+def init_warnings_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS warnings (
+        user_id INTEGER PRIMARY KEY,
+        count INTEGER DEFAULT 0,
+        username TEXT,
+        full_name TEXT,
+        last_reason TEXT,
+        updated_at TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+def get_warning_count(user_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT count FROM warnings WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def record_violation(user_id: int, username: str, full_name: str, reason: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO warnings (user_id, count, username, full_name, last_reason, updated_at)
+        VALUES (?, 1, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            count = count + 1,
+            username = excluded.username,
+            full_name = excluded.full_name,
+            last_reason = excluded.last_reason,
+            updated_at = excluded.updated_at
+    ''', (user_id, username, full_name, reason, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+    log.info("📋 User %s → %s warning(s)", user_id, get_warning_count(user_id))
+
+# ─── Telethon Clients ─────────────────────────────────────────────────────────
+bot_client = TelegramClient("bot_session", API_ID, API_HASH)
+USER_SESSION_RAW = os.environ.get("USER_SESSION_PATH", "/data/user_instance.session")
+USER_SESSION = ensure_session_dir(USER_SESSION_RAW)
+user_client = TelegramClient(USER_SESSION, API_ID, API_HASH)
 
 # ─── Userbot Login State ──────────────────────────────────────────────────────
-# Tracks the /connect flow per ADMIN_ID conversation
 connect_state: dict = {}
-# { ADMIN_ID: {"step": "phone"|"code"|"password", "phone": str, "phone_code_hash": str} }
-
 userbot_connected: bool = False
 
-# ─── In-Memory Stores ─────────────────────────────────────────────────────────
-warnings_db: dict = {}
-admin_state: dict = {}   # for /filter flow
+# ─── In-Memory Stores (for filter flow) ──────────────────────────────────────
+admin_state: dict = {}
 
 # ─── Pre-loaded Banned Words (English + Amharic) ──────────────────────────────
 banned_words: list = [
-
-    # ── ENGLISH: Signal selling / VIP promotion ───────────────────────────
     "dm me for signals", "dm for signals", "i sell signals",
     "selling signals", "join my vip", "join our vip",
     "vip signals", "paid signals", "premium signals",
     "signal provider", "signal service", "buy signals",
-
-    # ── ENGLISH: Recruitment / invite spam ────────────────────────────────
     "join my group", "join our group", "join my channel",
     "join our channel", "subscribe to my channel",
     "click the link", "link in bio", "check my bio",
     "use my referral", "referral link", "use my link",
     "register with my link", "deposit via my link",
     "use my code", "promo code", "invite link",
-
-    # ── ENGLISH: Scam / guaranteed profit ─────────────────────────────────
     "guaranteed profit", "guaranteed return", "100% profit",
     "risk free", "risk-free", "no loss", "double your money",
     "i will manage your account", "managed account",
@@ -105,52 +153,25 @@ banned_words: list = [
     "investment platform", "fund your account", "withdraw daily",
     "earn daily", "earn money online", "make money online",
     "passive income", "financial freedom",
-
-    # ── ENGLISH: Account selling ───────────────────────────────────────────
     "account for sale", "selling account", "buying account",
-    "broker account for sale", "ea for sale",
-    "robot for sale", "trading bot for sale",
-
-    # ── ENGLISH: Contact solicitation ─────────────────────────────────────
+    "broker account for sale", "ea for sale", "robot for sale",
     "whatsapp me", "contact me on whatsapp", "dm me",
     "message me", "inbox me", "contact for promo",
-    "available for hire", "hire me",
-    "i offer services", "we offer services",
-
-    # ── ENGLISH: Personal insults ─────────────────────────────────────────
-    "you idiot", "you are stupid", "you are dumb",
-    "you fool", "shut up", "go to hell",
+    "available for hire", "hire me", "i offer services", "we offer services",
+    "you idiot", "you are stupid", "you are dumb", "you fool", "shut up", "go to hell",
     "son of a bitch", "motherfucker", "you loser",
-
-    # ── AMHARIC: Signal selling / VIP promotion ───────────────────────────
-    "ሲግናል እሸጣለሁ", "ሲግናል እልካለሁ", "ሲግናል ይግዙ",
-    "ሲግናል ይጠቀሙ", "ሲግናል ቡድን", "ዲኤም አድርጉ",
-    "ዲኤም አድርጉኝ", "ለሲግናል ዲኤም", "ቪአይፒ ቡድን",
-    "ቪአይፒ ይቀላቀሉ", "ሲግናል ለማግኘት",
-
-    # ── AMHARIC: Recruitment / invite ─────────────────────────────────────
-    "ቡድኑን ይቀላቀሉ", "ቻናሉን ይቀላቀሉ", "ሊንኩን ይጫኑ",
-    "ሊንክ ይጠቀሙ", "ሪፈራል ሊንክ", "ሊንኬን ተጠቀሙ",
-    "ቻናሌን ተቀላቀሉ", "ቡድኔን ተቀላቀሉ", "ሊንኩን ተጫኑ",
-
-    # ── AMHARIC: Scam / guaranteed profit ─────────────────────────────────
-    "ትርፍ እናረጋግጣለን", "ትርፍ ዋስትና", "መቶ ፐርሰንት ትርፍ",
-    "ኪሳራ የለም", "ገንዘብ ይላኩ", "ዩኤስዲቲ ይላኩ",
-    "ቢቲሲ ይላኩ", "ሂሳብዎን ያስተዳድሩ", "ሂሳብ ያስተዳድራለሁ",
-    "ኢንቨስት ያድርጉ", "ኢንቨስትመንት", "ትርፍ ያግኙ",
-    "ዕለታዊ ትርፍ", "ገንዘብ ያስቀምጡ", "ፈጣን ትርፍ", "ሀብት ይሁኑ",
-
-    # ── AMHARIC: Account selling ───────────────────────────────────────────
-    "አካውንት ይሸጣል", "አካውንት እሸጣለሁ", "አካውንት ለሽያጭ",
-    "ሮቦት ለሽያጭ", "ኢኤ ለሽያጭ",
-
-    # ── AMHARIC: Contact solicitation ─────────────────────────────────────
+    # Amharic
+    "ሲግናል እሸጣለሁ", "ሲግናል እልካለሁ", "ሲግናል ይግዙ", "ሲግናል ይጠቀሙ", "ሲግናል ቡድን",
+    "ዲኤም አድርጉ", "ዲኤም አድርጉኝ", "ለሲግናል ዲኤም", "ቪአይፒ ቡድን", "ቪአይፒ ይቀላቀሉ",
+    "ሲግናል ለማግኘት", "ቡድኑን ይቀላቀሉ", "ቻናሉን ይቀላቀሉ", "ሊንኩን ይጫኑ", "ሊንክ ይጠቀሙ",
+    "ሪፈራል ሊንክ", "ሊንኬን ተጠቀሙ", "ቻናሌን ተቀላቀሉ", "ቡድኔን ተቀላቀሉ", "ሊንኩን ተጫኑ",
+    "ትርፍ እናረጋግጣለን", "ትርፍ ዋስትና", "መቶ ፐርሰንት ትርፍ", "ኪሳራ የለም", "ገንዘብ ይላኩ",
+    "ዩኤስዲቲ ይላኩ", "ቢቲሲ ይላኩ", "ሂሳብዎን ያስተዳድሩ", "ሂሳብ ያስተዳድራለሁ", "ኢንቨስት ያድርጉ",
+    "ኢንቨስትመንት", "ትርፍ ያግኙ", "ዕለታዊ ትርፍ", "ገንዘብ ያስቀምጡ", "ፈጣን ትርፍ", "ሀብት ይሁኑ",
+    "አካውንት ይሸጣል", "አካውንት እሸጣለሁ", "አካውንት ለሽያጭ", "ሮቦት ለሽያጭ", "ኢኤ ለሽያጭ",
     "ዋትሳፕ ያግኙኝ", "ቴሌግራም ያግኙኝ", "ያናግሩኝ", "መልዕክት ይላኩልኝ",
-
-    # ── AMHARIC: Personal insults ─────────────────────────────────────────
-    "ደደብ ነህ", "ደደብ ነሽ", "ሞኝ ነህ", "ሞኝ ነሽ",
-    "ዝምበል", "ውሻ", "አህያ", "ጅል ነህ", "ጅል ነሽ",
-    "ከንቱ", "ጊዜ ሌባ", "ፋይዳ የለህም", "ፋይዳ የለሽም",
+    "ደደብ ነህ", "ደደብ ነሽ", "ሞኝ ነህ", "ሞኝ ነሽ", "ዝምበል", "ውሻ", "አህያ", "ጅል ነህ", "ጅል ነሽ",
+    "ከንቱ", "ጊዜ ሌባ", "ፋይዳ የለህም", "ፋይዳ የለሽም"
 ]
 
 # ─── Suspicious patterns that trigger Gemini ──────────────────────────────────
@@ -171,9 +192,7 @@ MIN_WORDS_GEMINI = 5
 _gemini_queue: asyncio.Queue = asyncio.Queue()
 _last_gemini_call: float = 0.0
 
-
 async def gemini_queue_worker():
-    """Background worker — processes Gemini one at a time with gap."""
     global _last_gemini_call
     while True:
         text, future = await _gemini_queue.get()
@@ -192,19 +211,15 @@ async def gemini_queue_worker():
         finally:
             _gemini_queue.task_done()
 
-
 def should_use_gemini(text: str) -> bool:
-    """Only send to Gemini if long enough AND contains suspicious pattern."""
     if len(text.strip().split()) < MIN_WORDS_GEMINI:
         return False
     return bool(_suspicious_re.search(text))
-
 
 async def queue_gemini_analysis(text: str) -> dict:
     if not should_use_gemini(text):
         log.info("⏭️ Skipping Gemini (no suspicious pattern or too short)")
         return {"verdict": "ALLOWED", "reason": "Skipped."}
-
     loop = asyncio.get_event_loop()
     future = loop.create_future()
     await _gemini_queue.put((text, future))
@@ -218,12 +233,8 @@ async def queue_gemini_analysis(text: str) -> dict:
         log.warning("⚠️ Queue error: %s", exc)
         return {"verdict": "ALLOWED", "reason": "Error."}
 
-# ─── Gemini Prompt ────────────────────────────────────────────────────────────
-
 SYSTEM_PROMPT = """You are the AI moderation engine for a professional Forex trading Telegram group.
-
 Members write in BOTH English AND Amharic (አማርኛ). Analyse both equally.
-
 ✅ ALWAYS ALLOW:
 - Forex/crypto: currency pairs, trade ideas, entries, exits, SL/TP
 - Technical analysis: indicators, chart patterns, support/resistance
@@ -232,26 +243,20 @@ Members write in BOTH English AND Amharic (አማርኛ). Analyse both equally.
 - Risk management, lot size, leverage, drawdown
 - Market commentary, economic news, education, friendly chat
 - P&L sharing, trade screenshots
-
 ❌ PROHIBITED (English or Amharic):
 1. Paid signal ads or VIP group recruitment
 2. Scams: guaranteed profit, wallet deposit requests, managed accounts
 3. Recruiting to other channels/groups, referral links
 4. Personal insults or hate speech
 5. Completely off-topic spam/advertising
-
 RULES: When in doubt → ALLOWED. Missing a scam > banning a real trader.
-
 Respond ONLY with valid JSON, no markdown:
 {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence in English"}"""
 
-
 async def _call_gemini(text: str) -> dict:
-    """Direct Gemini call with key rotation + retry on 429."""
     prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
     keys_tried = 0
     total_keys = len(GEMINI_KEYS)
-
     while True:
         try:
             model = get_gemini_model()
@@ -265,13 +270,11 @@ async def _call_gemini(text: str) -> dict:
                 verdict = "ALLOWED"
             log.info("🤖 Gemini [key#%s] → %s | %s", _current_key_index + 1, verdict, reason)
             return {"verdict": verdict, "reason": reason}
-
         except Exception as exc:
             err_str = str(exc)
             if "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
                 keys_tried += 1
-                log.warning("⚠️ Key #%s quota exceeded (%s/%s tried)",
-                            _current_key_index + 1, keys_tried, total_keys)
+                log.warning("⚠️ Key #%s quota exceeded (%s/%s tried)", _current_key_index + 1, keys_tried, total_keys)
                 rotate_key()
                 if keys_tried >= total_keys:
                     retry_wait = 60
@@ -286,35 +289,7 @@ async def _call_gemini(text: str) -> dict:
             return {"verdict": "ALLOWED", "reason": "Gemini error — safe default."}
 
 # ─── Warning / Ban Helpers ────────────────────────────────────────────────────
-
-def get_warning_count(user_id: int) -> int:
-    return warnings_db.get(user_id, {}).get("count", 0)
-
-
-def record_violation(user_id: int, username: str, full_name: str, reason: str):
-    if user_id in warnings_db:
-        warnings_db[user_id]["count"] += 1
-        warnings_db[user_id]["last_reason"] = reason
-    else:
-        warnings_db[user_id] = {
-            "count": 1, "username": username,
-            "full_name": full_name, "last_reason": reason,
-        }
-    log.info("📋 User %s → %s warning(s)", user_id, warnings_db[user_id]["count"])
-
-# ─── Keyword Filter ───────────────────────────────────────────────────────────
-
-def keyword_is_banned(text: str):
-    lower = text.lower()
-    for word in banned_words:
-        if word.lower() in lower:
-            return word
-    return None
-
-# ─── Delete — prefer userbot, fallback to bot ─────────────────────────────────
-
 async def delete_msg(chat_id: int, message_id: int):
-    """Try userbot first (higher authority), fallback to bot client."""
     if userbot_connected:
         try:
             await user_client.delete_messages(chat_id, message_id)
@@ -328,7 +303,6 @@ async def delete_msg(chat_id: int, message_id: int):
     except Exception as exc:
         log.warning("Bot delete also failed: %s", exc)
 
-
 async def ban_user(chat_id: int, user_id: int):
     try:
         await bot_client(EditBannedRequest(
@@ -339,7 +313,6 @@ async def ban_user(chat_id: int, user_id: int):
         log.info("🔨 Banned user %s", user_id)
     except Exception as exc:
         log.error("Ban failed for %s: %s", user_id, exc)
-
 
 async def send_warning(event, reason: str, user_id: int, username: str, full_name: str):
     try:
@@ -353,15 +326,12 @@ async def send_warning(event, reason: str, user_id: int, username: str, full_nam
             parse_mode="md"
         )
         log.info("⚠️ Warning sent to %s, auto-delete in 5min", user_id)
-
         async def delete_warning_later():
             await asyncio.sleep(300)
             await delete_msg(event.chat_id, warning_msg.id)
-
         asyncio.create_task(delete_warning_later())
     except Exception as exc:
         log.warning("Warning send failed: %s", exc)
-
 
 async def notify_admin(user_id, username, full_name, text, reason, action):
     try:
@@ -380,7 +350,12 @@ async def notify_admin(user_id, username, full_name, text, reason, action):
     except Exception as exc:
         log.error("Admin notify failed: %s", exc)
 
-# ─── Filter Keyboard ──────────────────────────────────────────────────────────
+def keyword_is_banned(text: str):
+    lower = text.lower()
+    for word in banned_words:
+        if word.lower() in lower:
+            return word
+    return None
 
 def make_filter_keyboard():
     return [
@@ -407,12 +382,11 @@ async def cmd_start(event):
         "**How it works:**\n"
         "1️⃣ Keyword filter — instant, no API\n"
         "2️⃣ Suspicious messages → Gemini AI queue\n"
-        "3️⃣ Userbot deletes messages from other bots & links\n"
+        "3️⃣ Userbot deletes messages from target bot & others\n"
         "4️⃣ 1st offence → warning (deleted after 5min)\n"
         "5️⃣ 2nd offence → permanent ban + private report\n\n"
         "✅ English & Amharic | 🔄 Multi-key Gemini rotation"
     )
-
 
 @bot_client.on(events.NewMessage(pattern="/filter"))
 async def cmd_filter(event):
@@ -425,19 +399,14 @@ async def cmd_filter(event):
         buttons=make_filter_keyboard()
     )
 
-# ─── /connect — Userbot Login Flow ───────────────────────────────────────────
-
 @bot_client.on(events.NewMessage(pattern="/connect"))
 async def cmd_connect(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
-
     global userbot_connected
     if userbot_connected:
         await event.reply("✅ Userbot is already connected and active!")
         return
-
-    # Check if session file already exists (previously logged in)
     session_file = USER_SESSION + ".session" if not USER_SESSION.endswith(".session") else USER_SESSION
     if os.path.exists(session_file):
         await event.reply("🔄 Session file found. Trying to reconnect...")
@@ -454,14 +423,12 @@ async def cmd_connect(event):
                 return
         except Exception as exc:
             log.warning("Session reconnect failed: %s", exc)
-
     connect_state[ADMIN_ID] = {"step": "phone"}
     await event.reply(
         "📱 **Userbot Login**\n\n"
         "Please send your **phone number** with country code.\n"
         "Example: `+251912345678`"
     )
-
 
 @bot_client.on(events.NewMessage(pattern="/cancel"))
 async def cmd_cancel(event):
@@ -471,17 +438,12 @@ async def cmd_cancel(event):
     admin_state.pop(ADMIN_ID, None)
     await event.reply("✅ Cancelled.")
 
-
-# ─── Callback Query Handler ───────────────────────────────────────────────────
-
 @bot_client.on(events.CallbackQuery)
 async def callback_handler(event):
     if event.sender_id != ADMIN_ID:
         await event.answer("⛔ Admin only.", alert=True)
         return
-
     data = event.data
-
     if data == b"filter_add":
         admin_state[ADMIN_ID] = "awaiting_add"
         await event.edit(
@@ -490,7 +452,6 @@ async def callback_handler(event):
             "Example: `dm me` or `guaranteed profit` or `ሲግናል`",
             buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
         )
-
     elif data == b"filter_remove":
         if not banned_words:
             await event.answer("No words in filter yet!", alert=True)
@@ -503,7 +464,6 @@ async def callback_handler(event):
             f"Send the exact word to remove:",
             buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
         )
-
     elif data == b"filter_show":
         if not banned_words:
             await event.answer("Filter list is empty!", alert=True)
@@ -513,7 +473,6 @@ async def callback_handler(event):
             f"📋 **Banned Words ({len(banned_words)} total)**\n\n{word_list}",
             buttons=make_filter_keyboard()
         )
-
     elif data == b"filter_cancel":
         admin_state.pop(ADMIN_ID, None)
         await event.edit(
@@ -521,25 +480,18 @@ async def callback_handler(event):
             buttons=make_filter_keyboard()
         )
 
-
-# ─── Admin Private Text Handler (filter add/remove + /connect flow) ───────────
-
 @bot_client.on(events.NewMessage)
 async def admin_private_handler(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
     if event.text and event.text.startswith("/"):
         return
-
     text = (event.raw_text or "").strip()
     if not text:
         return
-
-    # ── /connect flow ──────────────────────────────────────────────────────
     conn = connect_state.get(ADMIN_ID)
     if conn:
         step = conn.get("step")
-
         if step == "phone":
             phone = text
             conn["phone"] = phone
@@ -551,8 +503,7 @@ async def admin_private_handler(event):
                 await event.reply(
                     "📩 **OTP sent to your Telegram!**\n\n"
                     "Please send the **verification code**.\n"
-                    "If you received `12345`, send it as `1 2 3 4 5` (with spaces) "
-                    "to avoid Telegram treating it as a forward."
+                    "If you received `12345`, send it as `1 2 3 4 5` (with spaces)."
                 )
             except FloodWaitError as e:
                 connect_state.pop(ADMIN_ID, None)
@@ -561,7 +512,6 @@ async def admin_private_handler(event):
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"❌ Failed to send code: {exc}")
             return
-
         if step == "code":
             code = text.replace(" ", "")
             phone = conn["phone"]
@@ -575,23 +525,18 @@ async def admin_private_handler(event):
                 await event.reply(
                     f"✅ **Userbot connected!**\n"
                     f"👤 Logged in as: **{me.first_name}** (@{me.username or 'no username'})\n\n"
-                    f"The userbot will now delete messages from other bots, "
-                    f"links, and @ usernames in your group."
+                    f"The userbot will now delete messages from the target bot, links, etc."
                 )
                 log.info("✅ Userbot logged in: %s", me.first_name)
             except SessionPasswordNeededError:
                 conn["step"] = "password"
-                await event.reply(
-                    "🔐 **2FA enabled on your account.**\n\n"
-                    "Please send your **Two-Factor Authentication password**:"
-                )
+                await event.reply("🔐 **2FA enabled.** Please send your password:")
             except PhoneCodeInvalidError:
-                await event.reply("❌ Wrong code. Please try again or use /connect to restart.")
+                await event.reply("❌ Wrong code. Use /connect to restart.")
             except Exception as exc:
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"❌ Login failed: {exc}")
             return
-
         if step == "password":
             password = text
             try:
@@ -610,40 +555,26 @@ async def admin_private_handler(event):
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"❌ 2FA failed: {exc}")
             return
-
-    # ── /filter flow ───────────────────────────────────────────────────────
     state = admin_state.get(ADMIN_ID)
     if not state:
         return
-
     word = text.lower()
-
     if state == "awaiting_add":
         admin_state.pop(ADMIN_ID, None)
         if word in banned_words:
             await event.reply(f"⚠️ `{word}` already in filter.", buttons=make_filter_keyboard())
         else:
             banned_words.append(word)
-            await event.reply(
-                f"✅ **Added:** `{word}`\nTotal: **{len(banned_words)}**",
-                buttons=make_filter_keyboard()
-            )
+            await event.reply(f"✅ **Added:** `{word}`\nTotal: **{len(banned_words)}**", buttons=make_filter_keyboard())
         log.info("🔧 Admin added: '%s'", word)
-
     elif state == "awaiting_remove":
         admin_state.pop(ADMIN_ID, None)
         if word in banned_words:
             banned_words.remove(word)
-            await event.reply(
-                f"✅ **Removed:** `{word}`\nTotal: **{len(banned_words)}**",
-                buttons=make_filter_keyboard()
-            )
+            await event.reply(f"✅ **Removed:** `{word}`\nTotal: **{len(banned_words)}**", buttons=make_filter_keyboard())
             log.info("🔧 Admin removed: '%s'", word)
         else:
-            await event.reply(
-                f"❌ `{word}` not found in filter.",
-                buttons=make_filter_keyboard()
-            )
+            await event.reply(f"❌ `{word}` not found in filter.", buttons=make_filter_keyboard())
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BOT CLIENT — Group Message Handler (members)
@@ -656,55 +587,35 @@ async def handle_group_message(event):
     sender = await event.get_sender()
     if sender is None:
         return
-
-    # Skip messages from our own bot
     me = await bot_client.get_me()
     if sender.id == me.id:
         return
-
-    # Skip admin (never touch admin messages)
+    # Skip human admin
     if sender.id == ADMIN_ID:
         return
-
     message_text = event.raw_text or ""
     if not message_text.strip():
         return
-
     user_id   = sender.id
     username  = getattr(sender, "username", "") or ""
-    full_name = " ".join(filter(None, [
-        getattr(sender, "first_name", ""),
-        getattr(sender, "last_name", ""),
-    ])) or username or str(user_id)
+    full_name = " ".join(filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])) or username or str(user_id)
     chat_id = event.chat_id
     is_bot  = getattr(sender, "bot", False)
-
-    log.info("📨 [%s%s | %s]: %s",
-             "🤖 " if is_bot else "", full_name, user_id, message_text[:80])
-
-    # ── Layer 1: Keyword filter — instant, no API ──────────────────────────
+    log.info("📨 [%s%s | %s]: %s", "🤖 " if is_bot else "", full_name, user_id, message_text[:80])
     matched_word = keyword_is_banned(message_text)
     if matched_word:
         violation_reason = f"Message contains banned word: '{matched_word}'"
         log.info("🚫 Keyword hit: '%s'", matched_word)
-
     else:
-        # ── Layer 2: Smart Gemini — only suspicious messages ───────────────
         result = await queue_gemini_analysis(message_text)
         if result["verdict"] != "PROHIBITED":
             return
         violation_reason = result["reason"]
-
-    # ── Act on violation ──────────────────────────────────────────────────
     await delete_msg(chat_id, event.id)
-
-    # Bots don't get warnings — just delete
     if is_bot:
         log.info("🤖 Bot message deleted (no warning for bots)")
         return
-
     prior = get_warning_count(user_id)
-
     if prior == 0:
         record_violation(user_id, username, full_name, violation_reason)
         await send_warning(event, violation_reason, user_id, username, full_name)
@@ -716,39 +627,47 @@ async def handle_group_message(event):
         log.info("🔨 Banned %s (%s)", full_name, user_id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# USERBOT CLIENT — Group Handler (deletes other bots + links + @ spam)
+# USERBOT CLIENT — Group Handler
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Patterns the userbot auto-deletes immediately
-_link_re     = re.compile(r"https?://|t\.me/|bit\.ly|wa\.me|tinyurl", re.IGNORECASE)
-_mention_re  = re.compile(r"@[a-zA-Z0-9_]{4,}")   # @username mentions
-
+# Patterns for link/mention deletion (for non-target bots and humans)
+_link_re    = re.compile(r"https?://|t\.me/|bit\.ly|wa\.me|tinyurl", re.IGNORECASE)
+_mention_re = re.compile(r"@[a-zA-Z0-9_]{4,}")
 
 @user_client.on(events.NewMessage(chats=GROUP_ID))
 async def userbot_group_handler(event):
     if not userbot_connected:
         return
-
     sender = await event.get_sender()
     if sender is None:
         return
-
-    # Skip ourselves and the admin
     me = await user_client.get_me()
+    # Never delete our own userbot or the human admin
     if sender.id in (me.id, ADMIN_ID):
         return
-
     message_text = event.raw_text or ""
-    chat_id      = event.chat_id
-    is_bot       = getattr(sender, "bot", False)
-    username     = getattr(sender, "username", "") or ""
-    full_name    = " ".join(filter(None, [
-        getattr(sender, "first_name", ""),
-        getattr(sender, "last_name", ""),
-    ])) or username or str(sender.id)
+    chat_id = event.chat_id
+    is_bot = getattr(sender, "bot", False)
+    username = getattr(sender, "username", "") or ""
+    full_name = " ".join(filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])) or username or str(sender.id)
 
-    # ── Delete messages from ANY other bot in the group ────────────────────
-    if is_bot:
+    # ── TARGET BOT: delete EVERY message unconditionally ──────────────────
+    target_match = False
+    if TARGET_BOT_USERNAME and username.lower() == TARGET_BOT_USERNAME.lower():
+        target_match = True
+    if TARGET_BOT_ID and sender.id == TARGET_BOT_ID:
+        target_match = True
+
+    if target_match:
+        try:
+            await user_client.delete_messages(chat_id, event.id)
+            log.info("🎯 [USERBOT] Deleted ALL messages from target bot: %s (%s)", full_name, sender.id)
+        except Exception as exc:
+            log.warning("Userbot failed to delete target bot msg: %s", exc)
+        return  # No further processing (no warnings/ban for bots)
+
+    # ── DELETE ALL BOTS (if enabled) ──────────────────────────────────────
+    if DELETE_ALL_BOTS and is_bot:
         try:
             await user_client.delete_messages(chat_id, event.id)
             log.info("🤖🗑️ [USERBOT] Deleted message from bot: %s (%s)", full_name, sender.id)
@@ -756,41 +675,33 @@ async def userbot_group_handler(event):
             log.warning("Userbot failed to delete bot msg: %s", exc)
         return
 
-    # ── Delete messages with links ─────────────────────────────────────────
-    if message_text and _link_re.search(message_text):
-        try:
-            await user_client.delete_messages(chat_id, event.id)
-            log.info("🔗🗑️ [USERBOT] Deleted link message from %s (%s)", full_name, sender.id)
-            # Also handle warn/ban through bot_client
-            await _handle_userbot_violation(
-                event, sender.id, username, full_name, chat_id,
-                f"Message contains a link: {message_text[:100]}"
-            )
-        except Exception as exc:
-            log.warning("Userbot failed to delete link msg: %s", exc)
-        return
-
-    # ── Delete messages with external @username mentions ──────────────────
+    # ── For humans and non-target bots: delete links and mentions ──────────
     if message_text:
-        mentions = _mention_re.findall(message_text)
-        # Filter out mentioning the bot or known group members (basic check)
-        external_mentions = [m for m in mentions if m.lower() not in
-                             (f"@{username.lower()}", f"@{me.username.lower() if me.username else ''}")]
-        if external_mentions:
+        if _link_re.search(message_text):
             try:
                 await user_client.delete_messages(chat_id, event.id)
-                log.info("👤🗑️ [USERBOT] Deleted @mention message from %s — mentions: %s",
-                         full_name, external_mentions)
-                await _handle_userbot_violation(
-                    event, sender.id, username, full_name, chat_id,
-                    f"Message contains external username mention: {', '.join(external_mentions)}"
-                )
+                log.info("🔗🗑️ [USERBOT] Deleted link message from %s (%s)", full_name, sender.id)
+                await _handle_userbot_violation(event, sender.id, username, full_name, chat_id,
+                                                f"Message contains a link: {message_text[:100]}")
             except Exception as exc:
-                log.warning("Userbot failed to delete mention msg: %s", exc)
-
+                log.warning("Userbot failed to delete link msg: %s", exc)
+            return
+        mentions = _mention_re.findall(message_text)
+        if mentions:
+            external_mentions = [m for m in mentions if m.lower() not in
+                                 (f"@{username.lower()}", f"@{me.username.lower() if me.username else ''}")]
+            if external_mentions:
+                try:
+                    await user_client.delete_messages(chat_id, event.id)
+                    log.info("👤🗑️ [USERBOT] Deleted @mention message from %s — mentions: %s",
+                             full_name, external_mentions)
+                    await _handle_userbot_violation(event, sender.id, username, full_name, chat_id,
+                                                    f"Message contains external username mention: {', '.join(external_mentions)}")
+                except Exception as exc:
+                    log.warning("Userbot failed to delete mention msg: %s", exc)
+                return
 
 async def _handle_userbot_violation(event, user_id, username, full_name, chat_id, reason):
-    """After userbot deletes a message, apply warn/ban logic via bot_client."""
     prior = get_warning_count(user_id)
     if prior == 0:
         record_violation(user_id, username, full_name, reason)
@@ -806,48 +717,33 @@ async def _handle_userbot_violation(event, user_id, username, full_name, chat_id
 
 async def main():
     global userbot_connected
-
-    # Start bot client
+    init_warnings_db()
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
     log.info("🤖 Bot: @%s (ID: %s)", me.username, me.id)
-
-    # Try to connect userbot from saved session
     try:
         os.makedirs(os.path.dirname(USER_SESSION) if os.path.dirname(USER_SESSION) else ".", exist_ok=True)
         await user_client.connect()
         if await user_client.is_user_authorized():
             userbot_connected = True
             ume = await user_client.get_me()
-            log.info("✅ Userbot: %s (@%s) — connected from saved session",
-                     ume.first_name, ume.username or "no username")
+            log.info("✅ Userbot: %s (@%s) — connected from saved session", ume.first_name, ume.username or "no username")
         else:
             log.info("⚠️ Userbot not logged in. Send /connect to your bot to log in.")
     except Exception as exc:
         log.warning("⚠️ Userbot connect attempt failed: %s", exc)
-
-    # Verify group access
     try:
         entity = await bot_client.get_entity(GROUP_ID)
         log.info("✅ Monitoring: %s (ID: %s)", entity.title, GROUP_ID)
     except Exception as exc:
         log.error("❌ Cannot access group %s: %s", GROUP_ID, exc)
-
-    # Start Gemini queue worker
     asyncio.create_task(gemini_queue_worker())
     log.info("📡 Gemini: gemini-2.0-flash | %s key(s) | Gap: %ss", len(GEMINI_KEYS), GEMINI_CALL_GAP)
-    log.info("👤 Admin: %s | /connect to activate userbot | /filter for keywords", ADMIN_ID)
-
-    # Run both clients simultaneously
+    log.info("👤 Admin: %s | Target bot: %s", ADMIN_ID, TARGET_BOT_USERNAME or TARGET_BOT_ID or "None")
     if userbot_connected:
-        await asyncio.gather(
-            bot_client.run_until_disconnected(),
-            user_client.run_until_disconnected(),
-        )
+        await asyncio.gather(bot_client.run_until_disconnected(), user_client.run_until_disconnected())
     else:
-        # Only bot_client running until userbot connects
         await bot_client.run_until_disconnected()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
