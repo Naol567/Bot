@@ -3,15 +3,9 @@ Forex Group Management Bot — Dual Client (Bot + Userbot)
 ─────────────────────────────────────────────────────────
 - Bot client: Spam filter + Keyword filter + Gemini AI
 - Userbot:   ONLY deletes messages from a specific target bot
+- Exempt channel: channel's own messages are NEVER moderated
+- Comments (replies) are moderated normally
 - Persistent warnings (SQLite on /data volume)
-
-FIXES INCLUDED:
-- asyncio.gather crash fixed (user_client runs only if connected)
-- is_spam false-positives fixed (Forex safe words, higher thresholds)
-- SQLite thread-safe with Lock
-- Session path handling fixed (no double .session)
-- /status command for health check
-- Userbot never deletes anything except the target bot
 """
 
 import os
@@ -54,6 +48,9 @@ GROUP_ID   = int(os.environ["GROUP_ID"])
 # ─── Target Bot (userbot will delete EVERY message from this bot only) ────────
 TARGET_BOT_USERNAME = os.environ.get("TARGET_BOT_USERNAME", "").lstrip("@")
 TARGET_BOT_ID = int(os.environ["TARGET_BOT_ID"]) if os.environ.get("TARGET_BOT_ID") else None
+
+# ─── Exempt Channel (channel's own posts are NEVER moderated) ────────────────
+EXEMPT_CHANNEL_ID = int(os.environ["EXEMPT_CHANNEL_ID"]) if os.environ.get("EXEMPT_CHANNEL_ID") else None
 
 # ─── Spam Detection Settings ──────────────────────────────────────────────────
 SPAM_CAPS_RATIO      = 0.75
@@ -486,10 +483,12 @@ async def cmd_start(event):
         return
     status = "✅ Connected" if userbot_connected else "❌ Not connected — use /connect"
     target = f"@{TARGET_BOT_USERNAME}" if TARGET_BOT_USERNAME else str(TARGET_BOT_ID or "Not set")
+    exempt = str(EXEMPT_CHANNEL_ID) if EXEMPT_CHANNEL_ID else "Not set"
     await event.reply(
         "🤖 **Forex Group Bot — Admin Panel**\n\n"
         f"👤 **Userbot:** {status}\n"
-        f"🎯 **Target bot:** {target}\n\n"
+        f"🎯 **Target bot:** {target}\n"
+        f"🛡️ **Exempt channel:** {exempt}\n\n"
         "**Commands:**\n"
         "/connect — Login personal account as userbot\n"
         "/filter  — Manage banned keywords\n"
@@ -500,8 +499,10 @@ async def cmd_start(event):
         "2️⃣ Keyword filter (instant, no API)\n"
         "3️⃣ Gemini AI queue (suspicious only)\n"
         "4️⃣ Userbot deletes target bot messages **only**\n"
-        "5️⃣ 1st offence → warning (auto-deleted in 5min)\n"
-        "6️⃣ 2nd offence → permanent ban + report\n\n"
+        "5️⃣ Exempt channel messages are NEVER moderated\n"
+        "6️⃣ Comments (replies) ARE moderated\n"
+        "7️⃣ 1st offence → warning (auto-deleted in 5min)\n"
+        "8️⃣ 2nd offence → permanent ban + report\n\n"
         "✅ English & Amharic | 🔄 Multi-key Gemini"
     )
 
@@ -519,6 +520,7 @@ async def cmd_status(event):
         f"📥 Gemini queue: {queue_size} message(s) pending\n"
         f"📝 Banned words: {len(banned_words)}\n"
         f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID or 'None'}\n"
+        f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID or 'None'}\n"
         f"🕒 Time (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -693,7 +695,7 @@ async def admin_private_handler(event):
             await event.reply(f"❌ `{word}` not found.", buttons=make_filter_keyboard())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOT CLIENT — Group Message Handler (spam + keyword + Gemini)
+# BOT CLIENT — Group Message Handler (exempt channel + normal moderation)
 # ═══════════════════════════════════════════════════════════════════════════════
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
 async def handle_group_message(event):
@@ -702,6 +704,12 @@ async def handle_group_message(event):
     sender = await event.get_sender()
     if sender is None:
         return
+
+    # --- Exempt channel: never moderate the channel's own posts ---
+    if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
+        log.info(f"🛡️ Exempt channel message ignored (ID: {sender.id})")
+        return
+
     me_bot = await bot_client.get_me()
     if sender.id == me_bot.id:
         return
@@ -727,18 +735,21 @@ async def handle_group_message(event):
 
     log.info("📨 [%s%s | %s]: %s", "🤖 " if is_bot else "", full_name, user_id, message_text[:80])
 
+    # Layer 0: Spam heuristics
     spam_flag, spam_reason = is_spam(message_text)
     if spam_flag:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Spam: {spam_reason}", is_bot)
         return
 
+    # Layer 1: Keyword filter
     matched_word = keyword_is_banned(message_text)
     if matched_word:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Banned word: '{matched_word}'", is_bot)
         return
 
+    # Layer 2: Gemini AI
     result = await queue_gemini_analysis(message_text)
     if result["verdict"] == "PROHIBITED":
         await _handle_violation(event, user_id, username, full_name, chat_id,
@@ -748,7 +759,7 @@ async def handle_group_message(event):
     log.info("✅ Allowed: %s", full_name)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# USERBOT CLIENT — ONLY deletes target bot messages (nothing else)
+# USERBOT CLIENT — ONLY deletes target bot messages (exempt channel also ignored)
 # ═══════════════════════════════════════════════════════════════════════════════
 @user_client.on(events.NewMessage(chats=GROUP_ID))
 async def userbot_target_bot_deleter(event):
@@ -757,6 +768,11 @@ async def userbot_target_bot_deleter(event):
     sender = await event.get_sender()
     if sender is None:
         return
+
+    # Also ignore exempt channel messages (they shouldn't be target anyway)
+    if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
+        return
+
     try:
         me_user = await user_client.get_me()
         if sender.id in (me_user.id, ADMIN_ID):
@@ -779,7 +795,7 @@ async def userbot_target_bot_deleter(event):
             log.warning("Failed to delete target bot message: %s", exc)
     # else: do absolutely nothing
 
-# ─── Entry Point (FIXED: only run user_client if connected) ───────────────────
+# ─── Entry Point ──────────────────────────────────────────────────────────────
 async def main():
     global userbot_connected
 
@@ -798,7 +814,7 @@ async def main():
             log.info("✅ Userbot: %s (@%s)", ume.first_name, ume.username or "no username")
         else:
             log.info("⚠️ Userbot not logged in. Send /connect to the bot.")
-            await user_client.disconnect()  # avoid dangling connection
+            await user_client.disconnect()
     except Exception as exc:
         log.warning("Userbot session load failed: %s", exc)
 
@@ -810,12 +826,13 @@ async def main():
         log.error("❌ Cannot access group: %s", exc)
 
     target_desc = f"@{TARGET_BOT_USERNAME}" if TARGET_BOT_USERNAME else str(TARGET_BOT_ID or "None")
+    exempt_desc = str(EXEMPT_CHANNEL_ID) if EXEMPT_CHANNEL_ID else "None"
     asyncio.create_task(gemini_queue_worker())
     log.info("📡 Gemini: %s key(s) | Gap: %ss", len(GEMINI_KEYS), GEMINI_CALL_GAP)
     log.info("🎯 Target bot (userbot deletes only this): %s", target_desc)
+    log.info("🛡️ Exempt channel (never moderated): %s", exempt_desc)
     log.info("👤 Admin: %s", ADMIN_ID)
 
-    # Run only the connected clients
     if userbot_connected:
         await asyncio.gather(
             bot_client.run_until_disconnected(),
