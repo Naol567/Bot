@@ -1,10 +1,9 @@
 """
 Forex Group Management Bot — Dual Client (Bot + Userbot)
 ─────────────────────────────────────────────────────────
-- Bot client: Keyword filter + Gemini AI for ALL messages (except admin/userbot)
-- Userbot:   ONLY deletes messages from a specific target bot (ads)
+- Bot client: Spam filter + Keyword filter + Gemini AI
+- Userbot:   ONLY deletes messages from a specific target bot
 - Persistent warnings (SQLite)
-- No extra deletions by userbot (no links, mentions, other bots)
 """
 
 import os
@@ -24,6 +23,7 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PasswordHashInvalidError,
     FloodWaitError,
+    MessageNotModifiedError,
 )
 import google.generativeai as genai
 
@@ -44,6 +44,52 @@ GROUP_ID   = int(os.environ["GROUP_ID"])
 # ─── Target Bot (userbot will delete EVERY message from this bot) ─────────────
 TARGET_BOT_USERNAME = os.environ.get("TARGET_BOT_USERNAME")  # without @
 TARGET_BOT_ID = int(os.environ["TARGET_BOT_ID"]) if os.environ.get("TARGET_BOT_ID") else None
+
+# ─── Spam Detection Settings ──────────────────────────────────────────────────
+SPAM_CAPS_RATIO = 0.5        # If >50% caps, mark as spam
+SPAM_REPEAT_CHARS = 5        # Repeated same char >5 times (e.g., "!!!!!")
+SPAM_MAX_PUNCTUATION = 0.3   # If >30% punctuation/emoji, mark as spam
+SPAM_MIN_WORD_LEN = 2        # Ignore very short words
+SPAM_REPEATED_WORDS = 3      # Same word repeated 3+ times (e.g., "spam spam spam")
+
+# Custom spam phrases (expanded list)
+SPAM_PHRASES = [
+    # Original
+    "experience", "camin",
+    # Signal selling / VIP groups
+    "dm for signals", "dm me for signals", "signal dm", "vip group", "paid signals",
+    "premium signals", "signal service", "buy signals", "sell signals", "signals channel",
+    "signals group", "vip signals", "exclusive signals", "signals provider", "signal master",
+    "forex signals", "crypto signals",
+    # Recruitment / invite to other groups
+    "join my group", "join our group", "join my channel", "join our channel",
+    "subscribe to my channel", "subscribe to our channel", "link in bio", "check my bio",
+    "referral link", "use my link", "invite link", "new group", "new channel",
+    "click the link", "click here", "follow me", "follow us",
+    # Scams / guaranteed profit
+    "guaranteed profit", "guaranteed returns", "100% profit", "risk free", "risk-free",
+    "no loss", "double your money", "managed account", "send me money", "send usdt",
+    "send btc", "invest with me", "investment platform", "fund your account",
+    "withdraw daily", "earn daily", "earn money online", "make money online",
+    "passive income", "financial freedom", "wealth academy", "rich quick",
+    "get rich", "millionaire",
+    # Account selling / EA / robots
+    "account for sale", "selling account", "buying account", "ea for sale",
+    "robot for sale", "trading bot for sale", "forex robot", "crypto robot",
+    "autopilot", "copy trade", "copy trading",
+    # Contact solicitation
+    "whatsapp me", "contact me on whatsapp", "dm me", "message me", "inbox me",
+    "contact for promo", "available for hire", "hire me", "i offer services",
+    "we offer services", "telegram me", "pm me",
+    # Common obfuscations (spaces, dots, etc.)
+    "d m f o r s i g n a l s", "v i p   g r o u p", "f r e e   m o n e y",
+    "g u a r a n t e e d", "w i t h d r a w", "d e p o s i t",
+    # Amharic additional
+    "ሲግናል ሸጭ", "ቪፒ ቡድን", "ነጻ ገንዘብ", "ፈጣን ሀብት", "ሂሳብ ሽያጭ",
+]
+
+# Compile regex for spam phrases (case-insensitive)
+_spam_phrase_re = re.compile(r'\b(?:' + '|'.join(re.escape(p) for p in SPAM_PHRASES) + r')\b', re.IGNORECASE)
 
 # ─── Gemini Setup — Key Rotation ──────────────────────────────────────────────
 _raw_keys   = os.environ["GEMINI_API_KEY"]
@@ -118,6 +164,58 @@ def record_violation(user_id: int, username: str, full_name: str, reason: str):
     conn.close()
     log.info("📋 User %s → %s warning(s)", user_id, get_warning_count(user_id))
 
+# ─── Spam Detection Function ─────────────────────────────────────────────────
+def is_spam(text: str) -> tuple:
+    """
+    Returns (is_spam, reason) based on various heuristics.
+    """
+    if not text:
+        return (False, "")
+
+    text_lower = text.lower()
+    words = text.split()
+    word_count = len(words)
+
+    # 1. Spam phrases
+    if _spam_phrase_re.search(text_lower):
+        return (True, "Contains spam phrase")
+
+    # 2. Excessive caps (only if message has letters)
+    letters = sum(1 for c in text if c.isalpha())
+    if letters > 0:
+        caps = sum(1 for c in text if c.isupper())
+        caps_ratio = caps / letters
+        if caps_ratio > SPAM_CAPS_RATIO and len(text) > 10:
+            return (True, f"Excessive capital letters ({caps_ratio*100:.0f}%)")
+
+    # 3. Repeated characters (e.g., "!!!!!", "loooool")
+    if re.search(r'(.)\1{' + str(SPAM_REPEAT_CHARS) + r',}', text):
+        return (True, "Repeated characters detected")
+
+    # 4. High punctuation/emoji ratio
+    punct_emojis = sum(1 for c in text if not c.isalnum() and not c.isspace())
+    if len(text) > 0 and punct_emojis / len(text) > SPAM_MAX_PUNCTUATION:
+        return (True, "Too many punctuation marks or emojis")
+
+    # 5. Repeated words (e.g., "spam spam spam")
+    if word_count >= SPAM_REPEATED_WORDS:
+        from collections import Counter
+        word_counts = Counter(words)
+        for w, cnt in word_counts.items():
+            if cnt >= SPAM_REPEATED_WORDS and len(w) > SPAM_MIN_WORD_LEN:
+                return (True, f"Word '{w}' repeated {cnt} times")
+
+    # 6. Garbage / random keyboard smashing (e.g., "asdf asdf asdf")
+    if word_count >= 3:
+        garbage_count = 0
+        for w in words:
+            if len(w) >= 4 and not re.search(r'[aeiouAEIOU]', w):
+                garbage_count += 1
+        if garbage_count / word_count > 0.5:
+            return (True, "Random keyboard spam")
+
+    return (False, "")
+
 # ─── Telethon Clients ─────────────────────────────────────────────────────────
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 USER_SESSION_RAW = os.environ.get("USER_SESSION_PATH", "/data/user_instance.session")
@@ -182,7 +280,7 @@ SUSPICIOUS_PATTERNS = [
 ]
 _suspicious_re = re.compile("|".join(SUSPICIOUS_PATTERNS), re.IGNORECASE)
 
-# ─── Gemini Queue — 1 request per 10 seconds ─────────────────────────────────
+# ─── Gemini Queue ─────────────────────────────────────────────────────────────
 GEMINI_CALL_GAP  = 10
 MIN_WORDS_GEMINI = 5
 
@@ -366,11 +464,12 @@ async def cmd_start(event):
         "/connect — Login your personal account as userbot\n"
         "/filter  — Manage banned keywords\n\n"
         "**How it works:**\n"
-        "1️⃣ Keyword filter — instant, no API\n"
-        "2️⃣ Suspicious messages → Gemini AI queue\n"
-        "3️⃣ Userbot deletes ONLY the target bot's messages\n"
-        "4️⃣ 1st offence → warning (deleted after 5min)\n"
-        "5️⃣ 2nd offence → permanent ban + private report\n\n"
+        "1️⃣ Spam filter (caps, repeats, phrases)\n"
+        "2️⃣ Keyword filter — instant, no API\n"
+        "3️⃣ Suspicious messages → Gemini AI queue\n"
+        "4️⃣ Userbot deletes ONLY the target bot's messages\n"
+        "5️⃣ 1st offence → warning (deleted after 5min)\n"
+        "6️⃣ 2nd offence → permanent ban + private report\n\n"
         "✅ English & Amharic | 🔄 Multi-key Gemini rotation"
     )
 
@@ -420,25 +519,32 @@ async def callback_handler(event):
         await event.answer("⛔ Admin only.", alert=True)
         return
     data = event.data
-    if data == b"filter_add":
-        admin_state[ADMIN_ID] = "awaiting_add"
-        await event.edit("➕ Send the word/phrase to ban.", buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]])
-    elif data == b"filter_remove":
-        if not banned_words:
-            await event.answer("No words in filter!", alert=True)
-            return
-        admin_state[ADMIN_ID] = "awaiting_remove"
-        word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(banned_words))
-        await event.edit(f"➖ Current words:\n{word_list}\n\nSend the exact word to remove:", buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]])
-    elif data == b"filter_show":
-        if not banned_words:
-            await event.answer("Filter list is empty!", alert=True)
-            return
-        word_list = "\n".join(f"• `{w}`" for w in banned_words)
-        await event.edit(f"📋 Banned Words ({len(banned_words)} total)\n\n{word_list}", buttons=make_filter_keyboard())
-    elif data == b"filter_cancel":
-        admin_state.pop(ADMIN_ID, None)
-        await event.edit(f"✅ Cancelled. — {len(banned_words)} word(s) active", buttons=make_filter_keyboard())
+    try:
+        if data == b"filter_add":
+            admin_state[ADMIN_ID] = "awaiting_add"
+            await event.edit("➕ Send the word/phrase to ban.", buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]])
+        elif data == b"filter_remove":
+            if not banned_words:
+                await event.answer("No words in filter!", alert=True)
+                return
+            admin_state[ADMIN_ID] = "awaiting_remove"
+            word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(banned_words))
+            await event.edit(f"➖ Current words:\n{word_list}\n\nSend the exact word to remove:", buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]])
+        elif data == b"filter_show":
+            if not banned_words:
+                await event.answer("Filter list is empty!", alert=True)
+                return
+            word_list = "\n".join(f"• `{w}`" for w in banned_words)
+            await event.edit(f"📋 Banned Words ({len(banned_words)} total)\n\n{word_list}", buttons=make_filter_keyboard())
+        elif data == b"filter_cancel":
+            admin_state.pop(ADMIN_ID, None)
+            await event.edit(f"✅ Cancelled. — {len(banned_words)} word(s) active", buttons=make_filter_keyboard())
+    except MessageNotModifiedError:
+        # Ignore: the message content is already the same
+        log.debug("Edit skipped: message content unchanged")
+    except Exception as e:
+        log.error(f"Error in callback_handler: {e}")
+        await event.answer("An error occurred.", alert=True)
 
 @bot_client.on(events.NewMessage)
 async def admin_private_handler(event):
@@ -521,7 +627,7 @@ async def admin_private_handler(event):
             await event.reply(f"❌ `{word}` not found.", buttons=make_filter_keyboard())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOT CLIENT — Group Message Handler (keyword + Gemini for ALL messages)
+# BOT CLIENT — Group Message Handler (spam + keyword + Gemini)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
@@ -532,10 +638,10 @@ async def handle_group_message(event):
     if sender is None:
         return
     me_bot = await bot_client.get_me()
-    # Skip: bot itself, human admin, and the userbot account
+    # Skip: bot itself, human admin
     if sender.id in (me_bot.id, ADMIN_ID):
         return
-    # Also skip if sender is the userbot (though userbot should never be in this handler anyway)
+    # Skip userbot if connected
     if userbot_connected:
         me_user = await user_client.get_me()
         if sender.id == me_user.id:
@@ -551,36 +657,65 @@ async def handle_group_message(event):
     chat_id = event.chat_id
     is_bot = getattr(sender, "bot", False)
 
-    # Check keyword filter
+    # ── Layer 0: Spam Detection (runs first) ────────────────────────────────
+    spam_flag, spam_reason = is_spam(message_text)
+    if spam_flag:
+        violation_reason = f"Spam detected: {spam_reason}"
+        log.info(f"🚫 Spam detected from {full_name}: {spam_reason}")
+        await delete_msg(chat_id, event.id)
+        if not is_bot:
+            prior = get_warning_count(user_id)
+            if prior == 0:
+                record_violation(user_id, username, full_name, violation_reason)
+                await send_warning(event, violation_reason, user_id, username, full_name)
+            else:
+                record_violation(user_id, username, full_name, violation_reason)
+                await ban_user(chat_id, user_id)
+                await notify_admin(user_id, username, full_name, message_text, violation_reason, "BANNED")
+        else:
+            log.info(f"🤖 Bot spam deleted (no warning): {full_name}")
+        return
+
+    # ── Layer 1: Keyword filter ────────────────────────────────────────────
     matched_word = keyword_is_banned(message_text)
     if matched_word:
         violation_reason = f"Banned word: '{matched_word}'"
         log.info(f"🚫 Keyword hit from {full_name}: {matched_word}")
-    else:
-        # Check Gemini (only if message is suspicious)
-        result = await queue_gemini_analysis(message_text)
-        if result["verdict"] != "PROHIBITED":
-            return
-        violation_reason = result["reason"]
-        log.info(f"🤖 Gemini prohibited from {full_name}: {violation_reason}")
-
-    # Delete the violating message
-    await delete_msg(chat_id, event.id)
-
-    # Bots do not receive warnings or bans (just deletion)
-    if is_bot:
-        log.info(f"🤖 Bot message deleted (no warning for bots): {full_name}")
+        await delete_msg(chat_id, event.id)
+        if not is_bot:
+            prior = get_warning_count(user_id)
+            if prior == 0:
+                record_violation(user_id, username, full_name, violation_reason)
+                await send_warning(event, violation_reason, user_id, username, full_name)
+            else:
+                record_violation(user_id, username, full_name, violation_reason)
+                await ban_user(chat_id, user_id)
+                await notify_admin(user_id, username, full_name, message_text, violation_reason, "BANNED")
+        else:
+            log.info(f"🤖 Bot keyword deleted (no warning): {full_name}")
         return
 
-    # Apply warning/ban to human users
-    prior = get_warning_count(user_id)
-    if prior == 0:
-        record_violation(user_id, username, full_name, violation_reason)
-        await send_warning(event, violation_reason, user_id, username, full_name)
-    else:
-        record_violation(user_id, username, full_name, violation_reason)
-        await ban_user(chat_id, user_id)
-        await notify_admin(user_id, username, full_name, message_text, violation_reason, "BANNED")
+    # ── Layer 2: Gemini AI (only if suspicious) ────────────────────────────
+    result = await queue_gemini_analysis(message_text)
+    if result["verdict"] == "PROHIBITED":
+        violation_reason = result["reason"]
+        log.info(f"🤖 Gemini prohibited from {full_name}: {violation_reason}")
+        await delete_msg(chat_id, event.id)
+        if not is_bot:
+            prior = get_warning_count(user_id)
+            if prior == 0:
+                record_violation(user_id, username, full_name, violation_reason)
+                await send_warning(event, violation_reason, user_id, username, full_name)
+            else:
+                record_violation(user_id, username, full_name, violation_reason)
+                await ban_user(chat_id, user_id)
+                await notify_admin(user_id, username, full_name, message_text, violation_reason, "BANNED")
+        else:
+            log.info(f"🤖 Bot Gemini deleted (no warning): {full_name}")
+        return
+
+    # If we reach here, message is allowed
+    log.info(f"✅ Allowed: {full_name}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # USERBOT CLIENT — ONLY deletes target bot messages (nothing else)
