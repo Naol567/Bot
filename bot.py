@@ -6,12 +6,12 @@ Forex Group Management Bot — Dual Client (Bot + Userbot)
 - Persistent warnings (SQLite on /data volume)
 
 FIXES INCLUDED:
+- asyncio.gather crash fixed (user_client runs only if connected)
 - is_spam false-positives fixed (Forex safe words, higher thresholds)
 - SQLite thread-safe with Lock
-- Userbot always runs, can be connected later with /connect
 - Session path handling fixed (no double .session)
 - /status command for health check
-- No extra deletions from userbot
+- Userbot never deletes anything except the target bot
 """
 
 import os
@@ -192,40 +192,33 @@ def is_spam(text: str) -> tuple:
     words = text.split()
     word_count = len(words)
 
-    # Spam phrases
     if _spam_phrase_re.search(text_lower):
         return (True, "Contains spam phrase")
 
-    # Forex safe words → skip heuristic checks
     lower_words = {w.lower().strip(".,!?()[]") for w in words}
     if lower_words & FOREX_SAFE_WORDS:
         return (False, "")
 
-    # Excessive caps (ASCII only)
     ascii_letters = sum(1 for c in text if c.isascii() and c.isalpha())
     if ascii_letters > 15:
         caps = sum(1 for c in text if c.isascii() and c.isupper())
         if caps / ascii_letters > SPAM_CAPS_RATIO:
             return (True, f"Excessive caps ({caps/ascii_letters*100:.0f}%)")
 
-    # Repeated characters
     if re.search(r'(.)\1{' + str(SPAM_REPEAT_CHARS) + r',}', text):
         return (True, "Repeated characters")
 
-    # High punctuation/emoji ratio
     if len(text) > 20:
         punct = sum(1 for c in text if not c.isalnum() and not c.isspace())
         if punct / len(text) > SPAM_MAX_PUNCTUATION:
             return (True, "Too many punctuation/emojis")
 
-    # Repeated words
     if word_count >= SPAM_REPEATED_WORDS + 1:
         word_counts = Counter(words)
         for w, cnt in word_counts.items():
             if cnt >= SPAM_REPEATED_WORDS and len(w) > SPAM_MIN_WORD_LEN:
                 return (True, f"Word '{w}' repeated {cnt} times")
 
-    # Garbage detection (ASCII only, skip Amharic)
     if word_count >= 3:
         ascii_words = [w for w in words if w.isascii()]
         if len(ascii_words) >= 3:
@@ -714,7 +707,6 @@ async def handle_group_message(event):
         return
     if sender.id == ADMIN_ID:
         return
-    # Skip userbot messages (if connected)
     if userbot_connected:
         try:
             me_user = await user_client.get_me()
@@ -735,21 +727,18 @@ async def handle_group_message(event):
 
     log.info("📨 [%s%s | %s]: %s", "🤖 " if is_bot else "", full_name, user_id, message_text[:80])
 
-    # Layer 0: Spam heuristics
     spam_flag, spam_reason = is_spam(message_text)
     if spam_flag:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Spam: {spam_reason}", is_bot)
         return
 
-    # Layer 1: Keyword filter
     matched_word = keyword_is_banned(message_text)
     if matched_word:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Banned word: '{matched_word}'", is_bot)
         return
 
-    # Layer 2: Gemini AI (only if suspicious)
     result = await queue_gemini_analysis(message_text)
     if result["verdict"] == "PROHIBITED":
         await _handle_violation(event, user_id, username, full_name, chat_id,
@@ -768,7 +757,6 @@ async def userbot_target_bot_deleter(event):
     sender = await event.get_sender()
     if sender is None:
         return
-    # Never delete messages from the userbot itself or the human admin
     try:
         me_user = await user_client.get_me()
         if sender.id in (me_user.id, ADMIN_ID):
@@ -791,7 +779,7 @@ async def userbot_target_bot_deleter(event):
             log.warning("Failed to delete target bot message: %s", exc)
     # else: do absolutely nothing
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ─── Entry Point (FIXED: only run user_client if connected) ───────────────────
 async def main():
     global userbot_connected
 
@@ -810,6 +798,7 @@ async def main():
             log.info("✅ Userbot: %s (@%s)", ume.first_name, ume.username or "no username")
         else:
             log.info("⚠️ Userbot not logged in. Send /connect to the bot.")
+            await user_client.disconnect()  # avoid dangling connection
     except Exception as exc:
         log.warning("Userbot session load failed: %s", exc)
 
@@ -826,11 +815,14 @@ async def main():
     log.info("🎯 Target bot (userbot deletes only this): %s", target_desc)
     log.info("👤 Admin: %s", ADMIN_ID)
 
-    # Run both clients simultaneously
-    await asyncio.gather(
-        bot_client.run_until_disconnected(),
-        user_client.run_until_disconnected(),
-    )
+    # Run only the connected clients
+    if userbot_connected:
+        await asyncio.gather(
+            bot_client.run_until_disconnected(),
+            user_client.run_until_disconnected(),
+        )
+    else:
+        await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
