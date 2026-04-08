@@ -5,6 +5,7 @@ Forex Group Management Bot — Dual Client (Bot + Userbot)
 - Userbot:   ONLY deletes messages from a specific target bot
 - Exempt channel: channel's own posts are NEVER moderated
 - Silent words: deleted without warning; after 3 strikes → ban
+- 🔥 NEW: Any forwarded message is deleted immediately (no warning)
 - Persistent warnings & silent violations (SQLite)
 """
 
@@ -142,7 +143,6 @@ def _db_conn():
 def init_warnings_db():
     with _db_lock:
         conn = _db_conn()
-        # Existing warnings table
         conn.execute('''CREATE TABLE IF NOT EXISTS warnings (
             user_id INTEGER PRIMARY KEY,
             count INTEGER DEFAULT 0,
@@ -151,13 +151,11 @@ def init_warnings_db():
             last_reason TEXT,
             updated_at TEXT
         )''')
-        # New table for silent violations (strike count)
         conn.execute('''CREATE TABLE IF NOT EXISTS silent_violations (
             user_id INTEGER PRIMARY KEY,
             count INTEGER DEFAULT 0,
             updated_at TEXT
         )''')
-        # New table for silent words
         conn.execute('''CREATE TABLE IF NOT EXISTS silent_words (
             word TEXT PRIMARY KEY
         )''')
@@ -573,6 +571,7 @@ async def cmd_start(event):
         "/status  — Show bot health\n"
         "/cancel  — Cancel current operation\n\n"
         "**Moderation layers:**\n"
+        "0️⃣ 🔥 **FORWARDED MESSAGES are deleted immediately**\n"
         "1️⃣ Spam heuristics (caps, repeats, phrases)\n"
         "2️⃣ Silent words (immediate delete, no warning)\n"
         "3️⃣ Keyword filter (warning then ban)\n"
@@ -838,7 +837,7 @@ async def admin_private_handler(event):
         return
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOT CLIENT — Group Message Handler (with silent delete)
+# BOT CLIENT — Group Message Handler (with FORWARD DELETE)
 # ═══════════════════════════════════════════════════════════════════════════════
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
 async def handle_group_message(event):
@@ -848,7 +847,7 @@ async def handle_group_message(event):
     if sender is None:
         return
 
-    # Exempt channel
+    # Exempt channel (channel's own posts are never moderated)
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
         log.info(f"🛡️ Exempt channel message ignored (ID: {sender.id})")
         return
@@ -867,21 +866,27 @@ async def handle_group_message(event):
             pass
 
     message_text = (event.raw_text or "").strip()
+    chat_id = event.chat_id
+
+    # 🔥 NEW: Delete any forwarded message immediately (no warning)
+    if event.message.forward:
+        await delete_msg(chat_id, event.id)
+        log.info("🚫 [FORWARD] Deleted forwarded message from %s (ID: %s)", sender.id, event.id)
+        return  # Do not process further
+
     if not message_text:
         return
 
     user_id = sender.id
     username = getattr(sender, "username", "") or ""
     full_name = " ".join(filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])) or username or str(user_id)
-    chat_id = event.chat_id
     is_bot = getattr(sender, "bot", False)
 
     log.info("📨 [%s%s | %s]: %s", "🤖 " if is_bot else "", full_name, user_id, message_text[:80])
 
-    # ── NEW: Silent word check (no warning, 3 strikes ban) ─────────────────
+    # ── Silent word check (no warning, 3 strikes ban) ─────────────────────────
     silent_word = message_contains_silent_word(message_text)
     if silent_word:
-        # Delete silently
         await delete_msg(chat_id, event.id)
         if not is_bot:
             strikes = increment_silent_violation(user_id)
@@ -896,21 +901,21 @@ async def handle_group_message(event):
             log.info(f"🤖 Bot silent delete (no strike): {full_name}")
         return
 
-    # ── Spam heuristics ───────────────────────────────────────────────────
+    # ── Spam heuristics ───────────────────────────────────────────────────────
     spam_flag, spam_reason = is_spam(message_text)
     if spam_flag:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Spam: {spam_reason}", is_bot)
         return
 
-    # ── Normal keyword filter ─────────────────────────────────────────────
+    # ── Normal keyword filter ─────────────────────────────────────────────────
     matched_word = keyword_is_banned(message_text)
     if matched_word:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Banned word: '{matched_word}'", is_bot)
         return
 
-    # ── Gemini AI ─────────────────────────────────────────────────────────
+    # ── Gemini AI ─────────────────────────────────────────────────────────────
     result = await queue_gemini_analysis(message_text)
     if result["verdict"] == "PROHIBITED":
         await _handle_violation(event, user_id, username, full_name, chat_id,
@@ -990,6 +995,7 @@ async def main():
     log.info("🎯 Target bot (userbot deletes only this): %s", target_desc)
     log.info("🛡️ Exempt channel (never moderated): %s", exempt_desc)
     log.info("🔇 Silent words loaded: %s", silent_count)
+    log.info("🔥 FORWARDED messages will be deleted immediately")
     log.info("👤 Admin: %s", ADMIN_ID)
 
     if userbot_connected:
