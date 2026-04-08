@@ -1,12 +1,8 @@
 """
 Forex Group Management Bot — Dual Client (Bot + Userbot)
 ─────────────────────────────────────────────────────────
-- Bot client: Spam filter + Keyword filter + Gemini AI + Silent Delete
-- Userbot:   ONLY deletes messages from a specific target bot
-- Exempt channel: channel's own posts are NEVER moderated
-- Silent words: deleted without warning; after 3 strikes → ban
-- 🔥 NEW: Any forwarded message is deleted immediately (no warning)
-- Persistent warnings & silent violations (SQLite)
+Version 13: Full featured with settings panel, /ask command,
+forward delete with exempt channels, private warnings, temp bans.
 """
 
 import os
@@ -94,17 +90,20 @@ _spam_phrase_re = re.compile(r'(?:' + '|'.join(re.escape(p) for p in SPAM_PHRASE
 _raw_keys = os.environ["GEMINI_API_KEY"]
 GEMINI_KEYS: list = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 _current_key_index = 0
+_gemini_quota_exhausted = False
 
 def get_gemini_model() -> genai.GenerativeModel:
     genai.configure(api_key=GEMINI_KEYS[_current_key_index])
     return genai.GenerativeModel("gemini-2.0-flash")
 
 def rotate_key() -> bool:
-    global _current_key_index
+    global _current_key_index, _gemini_quota_exhausted
     next_index = (_current_key_index + 1) % len(GEMINI_KEYS)
     if next_index == 0 and len(GEMINI_KEYS) == 1:
+        _gemini_quota_exhausted = True
         return False
     _current_key_index = next_index
+    _gemini_quota_exhausted = False
     log.info("🔄 Rotated to Gemini key #%s", _current_key_index + 1)
     return True
 
@@ -129,18 +128,18 @@ user_client = TelegramClient(USER_SESSION, API_ID, API_HASH)
 # ─── Global State ─────────────────────────────────────────────────────────────
 connect_state: dict = {}
 userbot_connected: bool = False
-admin_state: dict = {}      # for normal filter
-silent_admin_state: dict = {} # for silent filter
+admin_state: dict = {}
+silent_admin_state: dict = {}
 
-# ─── SQLite Warnings & Silent Violations (thread-safe) ───────────────────────
-DB_PATH = os.environ.get("DB_PATH", "/data/warnings.db")
+# ─── SQLite Database (Warnings, Silent Words, Settings) ──────────────────────
+DB_PATH = os.environ.get("DB_PATH", "/data/bot_data.db")
 _db_lock = threading.Lock()
 
 def _db_conn():
     os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def init_warnings_db():
+def init_db():
     with _db_lock:
         conn = _db_conn()
         conn.execute('''CREATE TABLE IF NOT EXISTS warnings (
@@ -159,10 +158,40 @@ def init_warnings_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS silent_words (
             word TEXT PRIMARY KEY
         )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )''')
+        default_settings = {
+            'private_warning': 'off',
+            'warning_duration': '300',
+            'temp_ban_duration': '0',
+            'delete_all_forwards': 'on',
+            'forward_exempt_channels': '',
+            'log_to_file': 'off',
+        }
+        for k, v in default_settings.items():
+            conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (k, v))
         conn.commit()
         conn.close()
-    log.info("✅ Warnings DB ready at %s", DB_PATH)
+    log.info("✅ Database initialized")
 
+def get_setting(key: str) -> str:
+    with _db_lock:
+        conn = _db_conn()
+        row = conn.execute("SELECT value FROM bot_settings WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row[0] if row else None
+
+def set_setting(key: str, value: str):
+    with _db_lock:
+        conn = _db_conn()
+        conn.execute("REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+        conn.close()
+    log.info(f"Setting {key} = {value}")
+
+# ─── Warning / Ban Helpers ───────────────────────────────────────────────────
 def get_warning_count(user_id: int) -> int:
     with _db_lock:
         conn = _db_conn()
@@ -247,7 +276,7 @@ def message_contains_silent_word(text: str) -> str:
             return word
     return None
 
-# ─── Spam Detection (unchanged) ──────────────────────────────────────────────
+# ─── Spam Detection ──────────────────────────────────────────────────────────
 def is_spam(text: str) -> tuple:
     if not text:
         return (False, "")
@@ -302,7 +331,7 @@ SUSPICIOUS_PATTERNS = [
 ]
 _suspicious_re = re.compile("|".join(SUSPICIOUS_PATTERNS), re.IGNORECASE)
 
-# ─── Gemini Queue ─────────────────────────────────────────────────────────────
+# ─── Gemini Queue ────────────────────────────────────────────────────────────
 GEMINI_CALL_GAP = 10
 MIN_WORDS_GEMINI = 5
 _gemini_queue: asyncio.Queue = asyncio.Queue()
@@ -374,6 +403,9 @@ Respond ONLY with valid JSON, no markdown:
 {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence in English"}"""
 
 async def _call_gemini(text: str) -> dict:
+    global _gemini_quota_exhausted
+    if _gemini_quota_exhausted:
+        return {"verdict": "ALLOWED", "reason": "Assistant offline."}
     prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
     keys_tried = 0
     total_keys = len(GEMINI_KEYS)
@@ -394,19 +426,15 @@ async def _call_gemini(text: str) -> dict:
             err_str = str(exc)
             if "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
                 keys_tried += 1
-                rotate_key()
-                if keys_tried >= total_keys:
-                    retry_wait = 60
-                    m = re.search(r'"seconds":\s*(\d+)', err_str)
-                    if m:
-                        retry_wait = min(int(m.group(1)) + 5, 120)
-                    log.warning("⏳ All keys exhausted. Waiting %ss...", retry_wait)
-                    await asyncio.sleep(retry_wait)
-                    keys_tried = 0
+                if not rotate_key():
+                    _gemini_quota_exhausted = True
+                    log.warning("⛔ All Gemini keys exhausted.")
+                    return {"verdict": "ALLOWED", "reason": "Assistant offline."}
                 continue
             log.warning("⚠️ Gemini error: %s", exc)
             return {"verdict": "ALLOWED", "reason": "Gemini error."}
 
+# ─── Rest of the code continues in next message...
 # ─── Moderation Helpers ───────────────────────────────────────────────────────
 async def delete_msg(chat_id: int, message_id: int):
     if userbot_connected:
@@ -420,34 +448,58 @@ async def delete_msg(chat_id: int, message_id: int):
     except Exception:
         pass
 
-async def ban_user(chat_id: int, user_id: int):
+async def ban_user(chat_id: int, user_id: int, duration_hours: int = 0):
+    until_date = None
+    if duration_hours > 0:
+        until_date = datetime.now(timezone.utc).timestamp() + (duration_hours * 3600)
     try:
         await bot_client(EditBannedRequest(
             channel=chat_id,
             participant=user_id,
-            banned_rights=ChatBannedRights(until_date=None, view_messages=True)
+            banned_rights=ChatBannedRights(until_date=until_date, view_messages=True)
         ))
-        log.info("🔨 Banned user %s", user_id)
+        if duration_hours > 0:
+            log.info(f"🔨 Temporarily banned user {user_id} for {duration_hours} hours")
+        else:
+            log.info("🔨 Permanently banned user %s", user_id)
     except Exception as exc:
         log.error("Ban failed for %s: %s", user_id, exc)
 
-async def send_warning(event, reason: str, user_id: int, username: str, full_name: str):
+async def send_private_warning(user_id: int, reason: str) -> bool:
     try:
+        await bot_client.send_message(
+            user_id,
+            f"⚠️ **Warning from Squad 4x group**\n\n"
+            f"You have violated the group rules: {reason}\n\n"
+            f"This is your **only warning**. Next violation will result in a ban.\n\n"
+            f"📋 **Reason:** {reason}",
+            parse_mode="md"
+        )
+        return True
+    except Exception:
+        return False
+
+async def send_warning(event, reason: str, user_id: int, username: str, full_name: str):
+    private_mode = get_setting('private_warning') == 'on'
+    success = False
+    if private_mode:
+        success = await send_private_warning(user_id, reason)
+    if not private_mode or not success:
         mention = f"@{username}" if username else f"[{full_name}](tg://user?id={user_id})"
         warning_msg = await bot_client.send_message(
             event.chat_id,
             f"⚠️ **Warning / ማስጠንቀቂያ** — {mention}\n\n"
-            f"🇬🇧 This is your **only warning**. Next violation = immediate ban.\n"
-            f"🇪🇹 ይህ **የመጨረሻ ማስጠንቀቂያዎ** ነው። ደግመው ከጣሱ ወዲያውኑ ይታገዳሉ።\n\n"
+            f"🇬🇧 This is your **only warning**. Next violation = ban.\n"
+            f"🇪🇹 ይህ **የመጨረሻ ማስጠንቀቂያዎ** ነው። ደግመው ከጣሱ ይታገዳሉ።\n\n"
             f"📋 **Reason:** {reason}",
             parse_mode="md"
         )
+        duration = int(get_setting('warning_duration') or 300)
         async def _delete_later():
-            await asyncio.sleep(300)
+            await asyncio.sleep(duration)
             await delete_msg(event.chat_id, warning_msg.id)
         asyncio.create_task(_delete_later())
-    except Exception as exc:
-        log.warning("Warning send failed: %s", exc)
+    log.info("⚠️ Warning sent to %s (private=%s)", user_id, private_mode and success)
 
 async def notify_admin(user_id, username, full_name, text, reason, action):
     try:
@@ -487,11 +539,13 @@ async def _handle_violation(event, user_id, username, full_name, chat_id,
         log.info("⚠️ Warned %s (%s)", full_name, user_id)
     else:
         record_violation(user_id, username, full_name, violation_reason)
-        await ban_user(chat_id, user_id)
-        await notify_admin(user_id, username, full_name, message_text, violation_reason, "🔨 BANNED")
+        temp_ban_hours = int(get_setting('temp_ban_duration') or 0)
+        await ban_user(chat_id, user_id, duration_hours=temp_ban_hours)
+        await notify_admin(user_id, username, full_name, message_text, violation_reason,
+                           f"BANNED ({temp_ban_hours}h)" if temp_ban_hours else "PERMANENT BAN")
         log.info("🔨 Banned %s (%s)", full_name, user_id)
 
-# ─── Banned Words List (normal filter) ────────────────────────────────────────
+# ─── Banned Words List ────────────────────────────────────────────────────────
 banned_words: list = [
     "dm me for signals", "dm for signals", "i sell signals",
     "selling signals", "join my vip", "join our vip",
@@ -531,20 +585,74 @@ banned_words: list = [
     "ጅል ነህ", "ጅል ነሽ", "ከንቱ", "ጊዜ ሌባ", "ፋይዳ የለህም", "ፋይዳ የለሽም",
 ]
 
-# ─── Keyboards ────────────────────────────────────────────────────────────────
-def make_filter_keyboard():
+# ─── Keyboards for Settings ───────────────────────────────────────────────────
+def get_main_settings_keyboard():
     return [
-        [Button.inline("➕ Add Word", b"filter_add"),
-         Button.inline("➖ Remove Word", b"filter_remove")],
-        [Button.inline("📋 Show All Words", b"filter_show")],
+        [Button.inline("⚠️ Warning Settings", b"set_warning")],
+        [Button.inline("🔨 Ban Settings", b"set_ban")],
+        [Button.inline("🔇 Silent Filter", b"set_silent")],
+        [Button.inline("📤 Forward Control", b"set_forward")],
+        [Button.inline("📝 Logging", b"set_logging")],
+        [Button.inline("🤖 AI Assistant", b"set_ai")],
+        [Button.inline("❌ Close", b"settings_close")]
     ]
 
-def make_silent_filter_keyboard():
+def get_warning_keyboard():
+    private = get_setting('private_warning')
+    duration = get_setting('warning_duration')
     return [
-        [Button.inline("➕ Add Silent Word", b"silent_add"),
-         Button.inline("➖ Remove Silent Word", b"silent_remove")],
-        [Button.inline("📋 Show Silent Words", b"silent_show")],
+        [Button.inline(f"Private warning: {'✅ ON' if private=='on' else '❌ OFF'}", b"toggle_private_warning")],
+        [Button.inline(f"Warning duration: {duration}s", b"set_warning_duration")],
+        [Button.inline("🔙 Back", b"settings_back")]
     ]
+
+def get_ban_keyboard():
+    temp_hours = get_setting('temp_ban_duration')
+    temp_hours_str = "Permanent" if temp_hours == '0' else f"{temp_hours} hours"
+    return [
+        [Button.inline(f"Temporary ban: {temp_hours_str}", b"set_temp_ban")],
+        [Button.inline("🔙 Back", b"settings_back")]
+    ]
+
+def get_forward_keyboard():
+    delete_all = get_setting('delete_all_forwards')
+    exempt = get_setting('forward_exempt_channels')
+    exempt_display = exempt if exempt else "None"
+    return [
+        [Button.inline(f"Delete all forwards: {'✅ ON' if delete_all=='on' else '❌ OFF'}", b"toggle_delete_forwards")],
+        [Button.inline(f"Exempt channels: {exempt_display[:20]}", b"set_exempt_channels")],
+        [Button.inline("🔙 Back", b"settings_back")]
+    ]
+
+def get_logging_keyboard():
+    log_file = get_setting('log_to_file')
+    return [
+        [Button.inline(f"Log to file: {'✅ ON' if log_file=='on' else '❌ OFF'}", b"toggle_log_file")],
+        [Button.inline("🔙 Back", b"settings_back")]
+    ]
+
+def get_ai_keyboard():
+    return [
+        [Button.inline("🤖 Ask AI with /ask", b"nothing")],
+        [Button.inline("🔙 Back", b"settings_back")]
+    ]
+
+async def ask_gemini(question: str) -> str:
+    global _gemini_quota_exhausted
+    if _gemini_quota_exhausted:
+        return "I'm sorry, I am currently unavailable as my assistant service is offline. Please try again later."
+    try:
+        model = get_gemini_model()
+        response = await asyncio.to_thread(model.generate_content, question)
+        answer = response.text.strip()
+        return f"🤖 *Squad 4x Assistant*:\n\n{answer}"
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
+            rotate_key()
+            if _gemini_quota_exhausted:
+                return "I'm sorry, my assistant service is currently offline. Please contact the group admin."
+        return "Sorry, I encountered an error while processing your request."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BOT CLIENT — Admin Commands
@@ -559,7 +667,7 @@ async def cmd_start(event):
     exempt = str(EXEMPT_CHANNEL_ID) if EXEMPT_CHANNEL_ID else "Not set"
     silent_count = len(get_silent_words())
     await event.reply(
-        "🤖 **Forex Group Bot — Admin Panel**\n\n"
+        "🤖 **Squad 4x Group Manager**\n\n"
         f"👤 **Userbot:** {status}\n"
         f"🎯 **Target bot:** {target}\n"
         f"🛡️ **Exempt channel:** {exempt}\n"
@@ -568,10 +676,12 @@ async def cmd_start(event):
         "/connect — Login personal account as userbot\n"
         "/filter  — Manage banned keywords (with warning)\n"
         "/silentfilter — Manage silent delete words (no warning, 3 strikes ban)\n"
+        "/settings — Open settings panel\n"
+        "/ask <question> — Ask AI assistant (Squad 4x helper)\n"
         "/status  — Show bot health\n"
         "/cancel  — Cancel current operation\n\n"
         "**Moderation layers:**\n"
-        "0️⃣ 🔥 **FORWARDED MESSAGES are deleted immediately**\n"
+        "0️⃣ 🔥 **FORWARDED messages are deleted immediately**\n"
         "1️⃣ Spam heuristics (caps, repeats, phrases)\n"
         "2️⃣ Silent words (immediate delete, no warning)\n"
         "3️⃣ Keyword filter (warning then ban)\n"
@@ -599,142 +709,85 @@ async def cmd_status(event):
         f"🔇 Silent words: {len(silent_words)}\n"
         f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID or 'None'}\n"
         f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID or 'None'}\n"
+        f"⚙️ Private warning: {get_setting('private_warning')}\n"
+        f"⏱️ Temp ban: {get_setting('temp_ban_duration')}h\n"
         f"🕒 Time (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
-@bot_client.on(events.NewMessage(pattern="/filter"))
-async def cmd_filter(event):
+@bot_client.on(events.NewMessage(pattern="/settings"))
+async def cmd_settings(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
-    await event.reply(
-        f"🔧 **Keyword Filter Panel**\n\nCurrently **{len(banned_words)}** banned word(s).",
-        buttons=make_filter_keyboard()
-    )
+    await event.reply("⚙️ **Bot Settings**\nChoose a category:", buttons=get_main_settings_keyboard())
 
-@bot_client.on(events.NewMessage(pattern="/silentfilter"))
-async def cmd_silent_filter(event):
+@bot_client.on(events.NewMessage(pattern="/ask"))
+async def cmd_ask(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
-    silent_words = get_silent_words()
-    await event.reply(
-        f"🔇 **Silent Delete Panel**\n\n"
-        f"Words here are deleted **without warning**. After 3 strikes → ban.\n"
-        f"Currently **{len(silent_words)}** silent word(s).",
-        buttons=make_silent_filter_keyboard()
-    )
-
-@bot_client.on(events.NewMessage(pattern="/connect"))
-async def cmd_connect(event):
-    if event.sender_id != ADMIN_ID or event.is_group:
+    question = event.raw_text.replace("/ask", "").strip()
+    if not question:
+        await event.reply("Please provide a question. Example: `/ask What is the best Forex strategy?`")
         return
-    global userbot_connected
-    if userbot_connected:
-        await event.reply("✅ Userbot already connected.")
-        return
-    session_file = USER_SESSION + ".session"
-    if os.path.exists(session_file):
-        await event.reply("🔄 Session found. Reconnecting...")
-        try:
-            await user_client.connect()
-            if await user_client.is_user_authorized():
-                userbot_connected = True
-                me = await user_client.get_me()
-                await event.reply(f"✅ Userbot reconnected!\n👤 {me.first_name} (@{me.username or 'no username'})")
-                return
-        except Exception as exc:
-            log.warning("Session reconnect failed: %s", exc)
-    connect_state[ADMIN_ID] = {"step": "phone"}
-    await event.reply("📱 **Userbot Login**\n\nSend your phone number with country code:\n`+251912345678`")
+    await event.reply("🤔 Thinking...")
+    answer = await ask_gemini(question)
+    await event.reply(answer, parse_mode="md")
 
-@bot_client.on(events.NewMessage(pattern="/cancel"))
-async def cmd_cancel(event):
-    if event.sender_id != ADMIN_ID or event.is_group:
-        return
-    connect_state.pop(ADMIN_ID, None)
-    admin_state.pop(ADMIN_ID, None)
-    silent_admin_state.pop(ADMIN_ID, None)
-    await event.reply("✅ Cancelled.")
-
-# ─── Callback Handler for Normal Filter ──────────────────────────────────────
+# ─── Callback Handler for Settings ──────────────────────────────────────────
 @bot_client.on(events.CallbackQuery)
-async def callback_handler(event):
+async def settings_callback(event):
     if event.sender_id != ADMIN_ID:
         await event.answer("⛔ Admin only.", alert=True)
         return
-    data = event.data
-    try:
-        if data == b"filter_add":
-            admin_state[ADMIN_ID] = "awaiting_add"
-            await event.edit(
-                "➕ **Add Banned Word**\n\nSend the word or phrase to ban.",
-                buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
-            )
-        elif data == b"filter_remove":
-            if not banned_words:
-                await event.answer("No words in filter!", alert=True)
-                return
-            admin_state[ADMIN_ID] = "awaiting_remove"
-            word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(banned_words))
-            await event.edit(
-                f"➖ **Remove Banned Word**\n\nCurrent words:\n{word_list}\n\nSend the exact word:",
-                buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
-            )
-        elif data == b"filter_show":
-            if not banned_words:
-                await event.answer("Filter list is empty!", alert=True)
-                return
-            word_list = "\n".join(f"• `{w}`" for w in banned_words)
-            await event.edit(
-                f"📋 **Banned Words ({len(banned_words)} total)**\n\n{word_list}",
-                buttons=make_filter_keyboard()
-            )
-        elif data == b"filter_cancel":
-            admin_state.pop(ADMIN_ID, None)
-            await event.edit(
-                f"✅ Cancelled. — {len(banned_words)} word(s) active",
-                buttons=make_filter_keyboard()
-            )
-        # ─── Silent filter callbacks ──────────────────────────────────────
-        elif data == b"silent_add":
-            silent_admin_state[ADMIN_ID] = "awaiting_silent_add"
-            await event.edit(
-                "🔇 **Add Silent Word**\n\nSend the word or phrase to delete silently (no warning).",
-                buttons=[[Button.inline("❌ Cancel", b"silent_cancel")]]
-            )
-        elif data == b"silent_remove":
-            silent_words = get_silent_words()
-            if not silent_words:
-                await event.answer("No silent words!", alert=True)
-                return
-            silent_admin_state[ADMIN_ID] = "awaiting_silent_remove"
-            word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(silent_words))
-            await event.edit(
-                f"🔇 **Remove Silent Word**\n\nCurrent words:\n{word_list}\n\nSend the exact word:",
-                buttons=[[Button.inline("❌ Cancel", b"silent_cancel")]]
-            )
-        elif data == b"silent_show":
-            silent_words = get_silent_words()
-            if not silent_words:
-                await event.answer("No silent words!", alert=True)
-                return
-            word_list = "\n".join(f"• `{w}`" for w in silent_words)
-            await event.edit(
-                f"🔇 **Silent Words ({len(silent_words)} total)**\n\n{word_list}",
-                buttons=make_silent_filter_keyboard()
-            )
-        elif data == b"silent_cancel":
-            silent_admin_state.pop(ADMIN_ID, None)
-            silent_words = get_silent_words()
-            await event.edit(
-                f"✅ Cancelled. — {len(silent_words)} silent word(s) active",
-                buttons=make_silent_filter_keyboard()
-            )
-    except MessageNotModifiedError:
-        pass
-    except Exception as exc:
-        log.error("Callback error: %s", exc)
+    data = event.data.decode()
+    if data == "settings_close":
+        await event.edit("Settings closed.")
+        return
+    elif data == "settings_back":
+        await event.edit("⚙️ **Bot Settings**\nChoose a category:", buttons=get_main_settings_keyboard())
+        return
+    elif data == "set_warning":
+        await event.edit("⚠️ **Warning Settings**", buttons=get_warning_keyboard())
+    elif data == "set_ban":
+        await event.edit("🔨 **Ban Settings**", buttons=get_ban_keyboard())
+    elif data == "set_silent":
+        await event.edit("🔇 Use /silentfilter to manage silent words.", buttons=[[Button.inline("🔙 Back", b"settings_back")]])
+    elif data == "set_forward":
+        await event.edit("📤 **Forward Control**", buttons=get_forward_keyboard())
+    elif data == "set_logging":
+        await event.edit("📝 **Logging Settings**", buttons=get_logging_keyboard())
+    elif data == "set_ai":
+        await event.edit("🤖 **AI Assistant**\nUse `/ask <question>` to chat with me.\nI am Squad 4x group assistant.", buttons=get_ai_keyboard())
+    elif data == "toggle_private_warning":
+        current = get_setting('private_warning')
+        new = 'off' if current == 'on' else 'on'
+        set_setting('private_warning', new)
+        await event.edit("⚠️ **Warning Settings**", buttons=get_warning_keyboard())
+        await event.answer(f"Private warning turned {new}", alert=True)
+    elif data == "set_warning_duration":
+        admin_state[ADMIN_ID] = "awaiting_warning_duration"
+        await event.edit("Please send the new warning duration in seconds (e.g., 300 for 5 minutes).\nSend /cancel to abort.")
+    elif data == "set_temp_ban":
+        admin_state[ADMIN_ID] = "awaiting_temp_ban"
+        await event.edit("Please send the temporary ban duration in hours (0 = permanent, e.g., 24 for one day).\nSend /cancel to abort.")
+    elif data == "toggle_delete_forwards":
+        current = get_setting('delete_all_forwards')
+        new = 'off' if current == 'on' else 'on'
+        set_setting('delete_all_forwards', new)
+        await event.edit("📤 **Forward Control**", buttons=get_forward_keyboard())
+        await event.answer(f"Delete all forwards turned {new}", alert=True)
+    elif data == "set_exempt_channels":
+        admin_state[ADMIN_ID] = "awaiting_exempt_channels"
+        await event.edit("Please send a comma-separated list of channel IDs to exempt from forward deletion (e.g., -1001234567890,-1009876543210).\nSend /cancel to abort.")
+    elif data == "toggle_log_file":
+        current = get_setting('log_to_file')
+        new = 'off' if current == 'on' else 'on'
+        set_setting('log_to_file', new)
+        await event.edit("📝 **Logging Settings**", buttons=get_logging_keyboard())
+        await event.answer(f"Log to file turned {new}", alert=True)
+    elif data == "nothing":
+        await event.answer("No action available.", alert=True)
 
-# ─── Admin Private Message Handler (for both filters) ────────────────────────
+# ─── Admin Private Message Handler ──────────────────────────────────────────
 @bot_client.on(events.NewMessage)
 async def admin_private_handler(event):
     if event.sender_id != ADMIN_ID or event.is_group:
@@ -745,7 +798,7 @@ async def admin_private_handler(event):
     if not text:
         return
 
-    # /connect flow (unchanged)
+    # /connect flow
     conn = connect_state.get(ADMIN_ID)
     if conn:
         step = conn.get("step")
@@ -798,11 +851,45 @@ async def admin_private_handler(event):
                 await event.reply(f"❌ 2FA failed: {exc}")
             return
 
-    # Normal filter add/remove
+    # Settings inputs
     state = admin_state.get(ADMIN_ID)
     if state:
+        if state == "awaiting_warning_duration":
+            try:
+                seconds = int(text)
+                if seconds < 10:
+                    await event.reply("Duration must be at least 10 seconds.")
+                    return
+                set_setting('warning_duration', str(seconds))
+                await event.reply(f"✅ Warning duration set to {seconds} seconds.", buttons=[[Button.inline("🔙 Back to Settings", b"settings_back")]])
+            except ValueError:
+                await event.reply("Please send a valid number (seconds).")
+            admin_state.pop(ADMIN_ID, None)
+        elif state == "awaiting_temp_ban":
+            try:
+                hours = int(text)
+                if hours < 0:
+                    await event.reply("Hours cannot be negative. 0 = permanent.")
+                    return
+                set_setting('temp_ban_duration', str(hours))
+                await event.reply(f"✅ Temporary ban set to {hours} hour(s).", buttons=[[Button.inline("🔙 Back to Settings", b"settings_back")]])
+            except ValueError:
+                await event.reply("Please send a valid number (hours).")
+            admin_state.pop(ADMIN_ID, None)
+        elif state == "awaiting_exempt_channels":
+            set_setting('forward_exempt_channels', text)
+            await event.reply(f"✅ Exempt channels set to: {text}", buttons=[[Button.inline("🔙 Back to Settings", b"settings_back")]])
+            admin_state.pop(ADMIN_ID, None)
+        else:
+            # Normal filter or silent filter
+            pass
+        return
+
+    # Normal filter add/remove (from /filter)
+    nstate = admin_state.get(ADMIN_ID)
+    if nstate and nstate in ("awaiting_add", "awaiting_remove"):
         word = text.lower()
-        if state == "awaiting_add":
+        if nstate == "awaiting_add":
             admin_state.pop(ADMIN_ID, None)
             if word in banned_words:
                 await event.reply(f"⚠️ `{word}` already in filter.", buttons=make_filter_keyboard())
@@ -810,7 +897,7 @@ async def admin_private_handler(event):
                 banned_words.append(word)
                 await event.reply(f"✅ **Added:** `{word}`\nTotal: **{len(banned_words)}**", buttons=make_filter_keyboard())
             log.info("🔧 Admin added: '%s'", word)
-        elif state == "awaiting_remove":
+        elif nstate == "awaiting_remove":
             admin_state.pop(ADMIN_ID, None)
             if word in banned_words:
                 banned_words.remove(word)
@@ -820,24 +907,117 @@ async def admin_private_handler(event):
                 await event.reply(f"❌ `{word}` not found.", buttons=make_filter_keyboard())
         return
 
-    # Silent filter add/remove
-    silent_state = silent_admin_state.get(ADMIN_ID)
-    if silent_state:
+    # Silent filter add/remove (from /silentfilter)
+    sstate = silent_admin_state.get(ADMIN_ID)
+    if sstate and sstate in ("awaiting_silent_add", "awaiting_silent_remove"):
         word = text.lower()
-        if silent_state == "awaiting_silent_add":
+        if sstate == "awaiting_silent_add":
             silent_admin_state.pop(ADMIN_ID, None)
             add_silent_word(word)
             silent_words = get_silent_words()
             await event.reply(f"🔇 **Added silent word:** `{word}`\nTotal silent: **{len(silent_words)}**", buttons=make_silent_filter_keyboard())
-        elif silent_state == "awaiting_silent_remove":
+        elif sstate == "awaiting_silent_remove":
             silent_admin_state.pop(ADMIN_ID, None)
             remove_silent_word(word)
             silent_words = get_silent_words()
             await event.reply(f"🔇 **Removed silent word:** `{word}`\nTotal silent: **{len(silent_words)}**", buttons=make_silent_filter_keyboard())
         return
 
+# ─── Filter Keyboards ────────────────────────────────────────────────────────
+def make_filter_keyboard():
+    return [
+        [Button.inline("➕ Add Word", b"filter_add"),
+         Button.inline("➖ Remove Word", b"filter_remove")],
+        [Button.inline("📋 Show All Words", b"filter_show")],
+    ]
+
+def make_silent_filter_keyboard():
+    return [
+        [Button.inline("➕ Add Silent Word", b"silent_add"),
+         Button.inline("➖ Remove Silent Word", b"silent_remove")],
+        [Button.inline("📋 Show Silent Words", b"silent_show")],
+    ]
+
+# ─── Callback Handler for Filter ────────────────────────────────────────────
+@bot_client.on(events.CallbackQuery)
+async def filter_callback_handler(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("⛔ Admin only.", alert=True)
+        return
+    data = event.data
+    try:
+        if data == b"filter_add":
+            admin_state[ADMIN_ID] = "awaiting_add"
+            await event.edit(
+                "➕ **Add Banned Word**\n\nSend the word or phrase to ban.",
+                buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
+            )
+        elif data == b"filter_remove":
+            if not banned_words:
+                await event.answer("No words in filter!", alert=True)
+                return
+            admin_state[ADMIN_ID] = "awaiting_remove"
+            word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(banned_words))
+            await event.edit(
+                f"➖ **Remove Banned Word**\n\nCurrent words:\n{word_list}\n\nSend the exact word:",
+                buttons=[[Button.inline("❌ Cancel", b"filter_cancel")]]
+            )
+        elif data == b"filter_show":
+            if not banned_words:
+                await event.answer("Filter list is empty!", alert=True)
+                return
+            word_list = "\n".join(f"• `{w}`" for w in banned_words)
+            await event.edit(
+                f"📋 **Banned Words ({len(banned_words)} total)**\n\n{word_list}",
+                buttons=make_filter_keyboard()
+            )
+        elif data == b"filter_cancel":
+            admin_state.pop(ADMIN_ID, None)
+            await event.edit(
+                f"✅ Cancelled. — {len(banned_words)} word(s) active",
+                buttons=make_filter_keyboard()
+            )
+        elif data == b"silent_add":
+            silent_admin_state[ADMIN_ID] = "awaiting_silent_add"
+            await event.edit(
+                "🔇 **Add Silent Word**\n\nSend the word or phrase to delete silently (no warning).",
+                buttons=[[Button.inline("❌ Cancel", b"silent_cancel")]]
+            )
+        elif data == b"silent_remove":
+            silent_words = get_silent_words()
+            if not silent_words:
+                await event.answer("No silent words!", alert=True)
+                return
+            silent_admin_state[ADMIN_ID] = "awaiting_silent_remove"
+            word_list = "\n".join(f"{i+1}. `{w}`" for i, w in enumerate(silent_words))
+            await event.edit(
+                f"🔇 **Remove Silent Word**\n\nCurrent words:\n{word_list}\n\nSend the exact word:",
+                buttons=[[Button.inline("❌ Cancel", b"silent_cancel")]]
+            )
+        elif data == b"silent_show":
+            silent_words = get_silent_words()
+            if not silent_words:
+                await event.answer("No silent words!", alert=True)
+                return
+            word_list = "\n".join(f"• `{w}`" for w in silent_words)
+            await event.edit(
+                f"🔇 **Silent Words ({len(silent_words)} total)**\n\n{word_list}",
+                buttons=make_silent_filter_keyboard()
+            )
+        elif data == b"silent_cancel":
+            silent_admin_state.pop(ADMIN_ID, None)
+            silent_words = get_silent_words()
+            await event.edit(
+                f"✅ Cancelled. — {len(silent_words)} silent word(s) active",
+                buttons=make_silent_filter_keyboard()
+            )
+    except MessageNotModifiedError:
+        pass
+    except Exception as exc:
+        log.error("Callback error: %s", exc)
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOT CLIENT — Group Message Handler (with FORWARD DELETE)
+# BOT CLIENT — Group Message Handler
 # ═══════════════════════════════════════════════════════════════════════════════
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
 async def handle_group_message(event):
@@ -868,11 +1048,23 @@ async def handle_group_message(event):
     message_text = (event.raw_text or "").strip()
     chat_id = event.chat_id
 
-    # 🔥 NEW: Delete any forwarded message immediately (no warning)
-    if event.message.forward:
-        await delete_msg(chat_id, event.id)
-        log.info("🚫 [FORWARD] Deleted forwarded message from %s (ID: %s)", sender.id, event.id)
-        return  # Do not process further
+    # Forward deletion based on settings
+    delete_all_forwards = get_setting('delete_all_forwards') == 'on'
+    if delete_all_forwards and event.message.forward:
+        exempt_str = get_setting('forward_exempt_channels') or ""
+        exempt_ids = [int(x.strip()) for x in exempt_str.split(",") if x.strip()]
+        forward_from_id = None
+        if event.message.forward.from_id:
+            if hasattr(event.message.forward.from_id, 'channel_id'):
+                forward_from_id = event.message.forward.from_id.channel_id
+            else:
+                forward_from_id = event.message.forward.from_id.user_id
+        if forward_from_id and forward_from_id in exempt_ids:
+            log.info(f"⏩ Exempt forward from channel {forward_from_id} ignored")
+        else:
+            await delete_msg(chat_id, event.id)
+            log.info("🚫 [FORWARD] Deleted forwarded message from %s", sender.id)
+            return
 
     if not message_text:
         return
@@ -884,7 +1076,7 @@ async def handle_group_message(event):
 
     log.info("📨 [%s%s | %s]: %s", "🤖 " if is_bot else "", full_name, user_id, message_text[:80])
 
-    # ── Silent word check (no warning, 3 strikes ban) ─────────────────────────
+    # Silent word check
     silent_word = message_contains_silent_word(message_text)
     if silent_word:
         await delete_msg(chat_id, event.id)
@@ -892,30 +1084,32 @@ async def handle_group_message(event):
             strikes = increment_silent_violation(user_id)
             log.info(f"🔇 Silent delete: '{silent_word}' from {full_name} (strike {strikes}/3)")
             if strikes >= 3:
-                await ban_user(chat_id, user_id)
+                temp_ban_hours = int(get_setting('temp_ban_duration') or 0)
+                await ban_user(chat_id, user_id, duration_hours=temp_ban_hours)
                 await notify_admin(user_id, username, full_name, message_text,
-                                   f"3 silent strikes (word: '{silent_word}')", "🔨 BANNED (silent strikes)")
+                                   f"3 silent strikes (word: '{silent_word}')",
+                                   f"BANNED ({temp_ban_hours}h)" if temp_ban_hours else "PERMANENT BAN")
                 reset_silent_violation(user_id)
                 log.info(f"🔨 Banned {full_name} due to 3 silent violations")
         else:
             log.info(f"🤖 Bot silent delete (no strike): {full_name}")
         return
 
-    # ── Spam heuristics ───────────────────────────────────────────────────────
+    # Spam heuristics
     spam_flag, spam_reason = is_spam(message_text)
     if spam_flag:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Spam: {spam_reason}", is_bot)
         return
 
-    # ── Normal keyword filter ─────────────────────────────────────────────────
+    # Normal keyword filter
     matched_word = keyword_is_banned(message_text)
     if matched_word:
         await _handle_violation(event, user_id, username, full_name, chat_id,
                                  message_text, f"Banned word: '{matched_word}'", is_bot)
         return
 
-    # ── Gemini AI ─────────────────────────────────────────────────────────────
+    # Gemini AI
     result = await queue_gemini_analysis(message_text)
     if result["verdict"] == "PROHIBITED":
         await _handle_violation(event, user_id, username, full_name, chat_id,
@@ -925,7 +1119,7 @@ async def handle_group_message(event):
     log.info("✅ Allowed: %s", full_name)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# USERBOT CLIENT — ONLY deletes target bot messages (nothing else)
+# USERBOT CLIENT — ONLY deletes target bot messages
 # ═══════════════════════════════════════════════════════════════════════════════
 @user_client.on(events.NewMessage(chats=GROUP_ID))
 async def userbot_target_bot_deleter(event):
@@ -963,7 +1157,7 @@ async def userbot_target_bot_deleter(event):
 async def main():
     global userbot_connected
 
-    init_warnings_db()
+    init_db()
     await bot_client.start(bot_token=BOT_TOKEN)
     bot_me = await bot_client.get_me()
     log.info("🤖 Bot: @%s (ID: %s)", bot_me.username, bot_me.id)
@@ -995,7 +1189,7 @@ async def main():
     log.info("🎯 Target bot (userbot deletes only this): %s", target_desc)
     log.info("🛡️ Exempt channel (never moderated): %s", exempt_desc)
     log.info("🔇 Silent words loaded: %s", silent_count)
-    log.info("🔥 FORWARDED messages will be deleted immediately")
+    log.info("🔥 Forward deletion: %s", get_setting('delete_all_forwards'))
     log.info("👤 Admin: %s", ADMIN_ID)
 
     if userbot_connected:
