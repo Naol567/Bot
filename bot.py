@@ -1,8 +1,10 @@
 """
-Squad 4x Group Manager – Fully Fixed for Railway/Render
-- Gemini with manual model selection + auto-rotation
-- Detailed logging (target bot, exempt channel, connections)
-- Persistent SQLite, dual clients, forward deletion
+Squad 4x Group Manager – Final Production Version
+- Your channel posts are NEVER deleted (EXEMPT_CHANNEL_ID)
+- Userbot ONLY deletes target bot messages
+- Bot client handles all moderation (filters, warnings, bans)
+- Gemini with auto key/model rotation
+- Warning messages auto-delete after 2 minutes
 """
 
 import os
@@ -33,7 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ==================== ENVIRONMENT VALIDATION ====================
+# ==================== ENVIRONMENT ====================
 def get_env_var(name: str, required: bool = True, default=None):
     value = os.environ.get(name, default)
     if required and value is None:
@@ -96,11 +98,11 @@ if not _raw_keys:
 else:
     GEMINI_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 
-# All free-tier models
+# All free-tier models (in order of preference)
 ALL_GEMINI_MODELS = [
+    "gemini-1.5-flash",      # Most stable free model
     "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
     "gemini-1.5-pro"
 ]
 _current_model_idx = 0
@@ -111,7 +113,6 @@ def get_gemini_config():
     """Returns (api_key, model_name) based on current rotation + manual setting"""
     if not GEMINI_KEYS:
         raise RuntimeError("No Gemini keys configured")
-    # Check if manual model is set in DB
     manual_model = get_setting("gemini_model")
     if manual_model and manual_model in ALL_GEMINI_MODELS:
         model = manual_model
@@ -161,7 +162,7 @@ async def call_gemini_with_rotation(prompt):
                 if not rotate_gemini():
                     return None
                 continue
-            # Non‑quota error – treat as permanent failure for this request
+            # Non‑quota error – treat as permanent for this request
             return None
     return None
 
@@ -202,7 +203,7 @@ DB_PATH = get_env_var("DB_PATH", required=False, default="/data/bot_data.db")
 _db_lock = threading.Lock()
 
 def _db_conn():
-    global DB_PATH  # ✅ Must be first line in function
+    global DB_PATH
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         try:
@@ -224,11 +225,11 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
         defaults = {
             'private_warning': 'off',
-            'warning_duration': '300',
+            'warning_duration': '120',      # 2 minutes default
             'temp_ban_duration': '0',
             'delete_all_forwards': 'on',
             'forward_exempt_channels': '',
-            'gemini_model': '',  # empty = auto-rotate
+            'gemini_model': '',
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?,?)", (k, v))
@@ -462,15 +463,9 @@ async def _call_gemini(text):
         log.warning(f"Gemini parse error: {e}")
         return {"verdict": "ALLOWED", "reason": "Parse error"}
 
-# ==================== MODERATION HELPERS ====================
+# ==================== MODERATION HELPERS (BOT ONLY) ====================
 async def delete_msg(chat_id, msg_id):
-    if userbot_connected:
-        try:
-            await user_client.delete_messages(chat_id, msg_id)
-            log.info(f"🗑️ Deleted message {msg_id} using userbot")
-            return
-        except Exception as e:
-            log.warning(f"Userbot delete failed: {e}")
+    """Delete message using bot only (userbot only deletes target bot)"""
     try:
         await bot_client.delete_messages(chat_id, msg_id)
         log.info(f"🗑️ Deleted message {msg_id} using bot")
@@ -510,7 +505,7 @@ async def send_warning(event, reason, user_id, username, full_name):
     msg = await bot_client.send_message(event.chat_id,
         f"⚠️ **Warning** — {mention}\n\nThis is your **only warning**. Next violation = ban.\n\n📋 Reason: {reason}",
         parse_mode="md")
-    duration = int(get_setting('warning_duration') or 300)
+    duration = int(get_setting('warning_duration') or 120)
     async def delete_later():
         await asyncio.sleep(duration)
         await delete_msg(event.chat_id, msg.id)
@@ -763,7 +758,6 @@ async def callback_handler(event):
         return
     data = event.data
 
-    # Filter callbacks
     if data == b"filter_add":
         admin_state[ADMIN_ID] = "awaiting_add"
         await event.edit("Send word to ban.", buttons=[[Button.inline("Cancel", b"filter_cancel")]])
@@ -787,7 +781,6 @@ async def callback_handler(event):
         await event.edit("Cancelled.", buttons=make_filter_keyboard())
         return
 
-    # Silent filter callbacks
     if data == b"silent_add":
         silent_admin_state[ADMIN_ID] = "awaiting_silent_add"
         await event.edit("Send silent word.", buttons=[[Button.inline("Cancel", b"silent_cancel")]])
@@ -813,7 +806,6 @@ async def callback_handler(event):
         await event.edit("Cancelled.", buttons=make_silent_filter_keyboard())
         return
 
-    # Settings callbacks
     try:
         d = data.decode()
     except:
@@ -856,7 +848,7 @@ async def callback_handler(event):
         return
     if d == "set_warning_duration":
         admin_state[ADMIN_ID] = "awaiting_warning_duration"
-        await event.edit("Send duration in seconds (e.g., 300 for 5 min).\nSend /cancel to abort.")
+        await event.edit("Send duration in seconds (e.g., 120 for 2 min).\nSend /cancel to abort.")
         return
     if d == "set_temp_ban":
         admin_state[ADMIN_ID] = "awaiting_temp_ban"
@@ -888,7 +880,6 @@ async def admin_private_handler(event):
     if not text:
         return
 
-    # Connect flow
     conn = connect_state.get(ADMIN_ID)
     if conn:
         step = conn.get("step")
@@ -945,7 +936,6 @@ async def admin_private_handler(event):
                 log.error(f"2FA error: {e}")
             return
 
-    # Settings inputs
     state = admin_state.get(ADMIN_ID)
     if state == "awaiting_warning_duration":
         try:
@@ -977,7 +967,6 @@ async def admin_private_handler(event):
         admin_state.pop(ADMIN_ID, None)
         return
 
-    # Filter add/remove
     if state == "awaiting_add":
         word = text.lower()
         admin_state.pop(ADMIN_ID, None)
@@ -997,7 +986,6 @@ async def admin_private_handler(event):
             await event.reply(f"❌ `{word}` not found.", buttons=make_filter_keyboard())
         return
 
-    # Silent filter add/remove
     sstate = silent_admin_state.get(ADMIN_ID)
     if sstate == "awaiting_silent_add":
         word = text.lower()
@@ -1021,7 +1009,7 @@ async def group_handler(event):
     if sender is None:
         return
 
-    # Exempt channel (your channel's own posts are never moderated)
+    # ⭐ YOUR CHANNEL POSTS ARE NEVER MODERATED
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
         log.info(f"🛡️ Exempt channel post ignored (sender {sender.id})")
         return
@@ -1029,13 +1017,9 @@ async def group_handler(event):
     me_bot = await bot_client.get_me()
     if sender.id == me_bot.id or sender.id == ADMIN_ID:
         return
-    if userbot_connected:
-        try:
-            me_user = await user_client.get_me()
-            if sender.id == me_user.id:
-                return
-        except:
-            pass
+
+    # Userbot is NOT used for moderation deletions, only for target bot later
+    # So we don't check userbot here.
 
     msg_text = event.raw_text or ""
     chat_id = event.chat_id
@@ -1104,22 +1088,24 @@ async def group_handler(event):
 
     log.info(f"✅ Allowed: {fullname}")
 
-# ==================== USERBOT TARGET DELETER ====================
+# ==================== USERBOT ONLY TARGET BOT DELETER ====================
 @user_client.on(events.NewMessage(chats=GROUP_ID))
 async def userbot_target_deleter(event):
+    """Userbot ONLY deletes messages from the target bot. Does nothing else."""
     if not userbot_connected:
         return
     sender = await event.get_sender()
     if sender is None:
         return
+    # Never delete exempt channel messages
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
         return
     try:
         me_user = await user_client.get_me()
-        if sender.id in (me_user.id, ADMIN_ID):
+        if sender.id == me_user.id:
             return
     except:
-        return
+        pass
     uname = (getattr(sender, "username", "") or "").lower()
     target = False
     if TARGET_BOT_USERNAME and uname == TARGET_BOT_USERNAME.lower():
@@ -1129,14 +1115,49 @@ async def userbot_target_deleter(event):
     if target:
         try:
             await user_client.delete_messages(event.chat_id, event.id)
-            log.info(f"🎯 Deleted target bot msg from {uname or sender.id}")
+            log.info(f"🎯 Userbot deleted target bot msg from {uname or sender.id}")
         except Exception as e:
             log.warning(f"Target bot delete failed: {e}")
+
+# ==================== AUTO-RECONNECTION ====================
+async def run_bot_with_reconnect():
+    while True:
+        try:
+            await bot_client.run_until_disconnected()
+            log.warning("Bot client disconnected, reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
+            await bot_client.connect()
+            if not await bot_client.is_user_authorized():
+                await bot_client.start(bot_token=BOT_TOKEN)
+            log.info("Bot client reconnected successfully")
+        except Exception as e:
+            log.error(f"Bot client fatal error: {e}, retrying in 10 seconds...")
+            await asyncio.sleep(10)
+
+async def run_userbot_with_reconnect():
+    global userbot_connected
+    while True:
+        try:
+            await user_client.run_until_disconnected()
+            log.warning("User client disconnected, reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
+            await user_client.connect()
+            if await user_client.is_user_authorized():
+                userbot_connected = True
+                log.info("User client reconnected successfully")
+            else:
+                userbot_connected = False
+                log.info("User client not authorized, use /connect")
+        except Exception as e:
+            log.error(f"User client fatal error: {e}, retrying in 10 seconds...")
+            userbot_connected = False
+            await asyncio.sleep(10)
 
 # ==================== MAIN ====================
 async def main():
     global userbot_connected
     init_db()
+
     await bot_client.start(bot_token=BOT_TOKEN)
     log.info(f"🚀 Bot started: {(await bot_client.get_me()).username}")
 
@@ -1160,12 +1181,13 @@ async def main():
 
     asyncio.create_task(gemini_queue_worker())
     log.info(f"🤖 Gemini: {len(GEMINI_KEYS)} keys | Models: {len(ALL_GEMINI_MODELS)} | Gap {GEMINI_CALL_GAP}s")
-    log.info(f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID}")
-    log.info(f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID}")
-    if userbot_connected:
-        await asyncio.gather(bot_client.run_until_disconnected(), user_client.run_until_disconnected())
-    else:
-        await bot_client.run_until_disconnected()
+    log.info(f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID} (messages from this channel are NEVER deleted)")
+    log.info(f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID} (userbot will delete its messages only)")
+
+    await asyncio.gather(
+        run_bot_with_reconnect(),
+        run_userbot_with_reconnect()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
