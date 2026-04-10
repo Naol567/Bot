@@ -1,10 +1,11 @@
 """
-Squad 4x Group Manager – Final Production Version
+Squad 4x Group Manager – Fully Fixed Production Version
 - Your channel posts are NEVER deleted (EXEMPT_CHANNEL_ID)
 - Userbot ONLY deletes target bot messages
 - Bot client handles all moderation (filters, warnings, bans)
-- Gemini with auto key/model rotation
-- Warning messages auto-delete after 2 minutes
+- Gemini with auto key/model rotation + manual model selection
+- Warning messages auto-delete after 2 minutes (120s)
+- Stable login flow – no disconnection during /connect
 """
 
 import os
@@ -124,10 +125,8 @@ def get_gemini_config():
 def rotate_gemini():
     """Rotate key or model when quota exhausted"""
     global _current_key_idx, _current_model_idx, _gemini_quota_exhausted
-    # Try next model first
     _current_model_idx += 1
     if _current_model_idx >= len(ALL_GEMINI_MODELS):
-        # All models exhausted for this key, try next key
         _current_model_idx = 0
         _current_key_idx = (_current_key_idx + 1) % len(GEMINI_KEYS)
         if _current_key_idx == 0:
@@ -162,7 +161,6 @@ async def call_gemini_with_rotation(prompt):
                 if not rotate_gemini():
                     return None
                 continue
-            # Non‑quota error – treat as permanent for this request
             return None
     return None
 
@@ -197,6 +195,7 @@ connect_state = {}
 userbot_connected = False
 admin_state = {}
 silent_admin_state = {}
+_login_in_progress = False   # Prevent reconnection during login
 
 # ==================== SQLITE DATABASE ====================
 DB_PATH = get_env_var("DB_PATH", required=False, default="/data/bot_data.db")
@@ -663,9 +662,13 @@ async def start_cmd(event):
 async def connect_cmd(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
-    global userbot_connected
+    global userbot_connected, _login_in_progress
     if userbot_connected:
         await event.reply("✅ Userbot already connected.")
+        return
+    # If a login is already in progress, don't start another
+    if ADMIN_ID in connect_state:
+        await event.reply("⏳ Login already in progress. Use /cancel to abort.")
         return
     session_file = USER_SESSION_PATH + ".session"
     if os.path.exists(session_file):
@@ -681,15 +684,18 @@ async def connect_cmd(event):
         except Exception as e:
             log.warning(f"Reconnect failed: {e}")
     connect_state[ADMIN_ID] = {"step": "phone"}
+    _login_in_progress = True
     await event.reply("📱 Send your phone number with country code (e.g., +251912345678)")
 
 @bot_client.on(events.NewMessage(pattern="/cancel"))
 async def cancel_cmd(event):
+    global _login_in_progress
     if event.sender_id != ADMIN_ID or event.is_group:
         return
     connect_state.pop(ADMIN_ID, None)
     admin_state.pop(ADMIN_ID, None)
     silent_admin_state.pop(ADMIN_ID, None)
+    _login_in_progress = False
     await event.reply("✅ Cancelled.")
 
 @bot_client.on(events.NewMessage(pattern="/filter"))
@@ -869,9 +875,10 @@ async def callback_handler(event):
         await event.answer("No action", alert=True)
         return
 
-# ==================== ADMIN PRIVATE MESSAGE HANDLER ====================
+# ==================== ADMIN PRIVATE MESSAGE HANDLER (FIXED LOGIN) ====================
 @bot_client.on(events.NewMessage)
 async def admin_private_handler(event):
+    global _login_in_progress, userbot_connected
     if event.sender_id != ADMIN_ID or event.is_group:
         return
     if event.text and event.text.startswith("/"):
@@ -883,10 +890,14 @@ async def admin_private_handler(event):
     conn = connect_state.get(ADMIN_ID)
     if conn:
         step = conn.get("step")
+        # Login is in progress – keep reconnection paused
+
         if step == "phone":
             conn["phone"] = text
             try:
-                await user_client.connect()
+                # Ensure client is connected before sending code
+                if not user_client.is_connected():
+                    await user_client.connect()
                 result = await user_client.send_code_request(text)
                 conn["phone_code_hash"] = result.phone_code_hash
                 conn["step"] = "code"
@@ -896,46 +907,61 @@ async def admin_private_handler(event):
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"Flood wait {e.seconds}s")
                 log.warning(f"Flood wait {e.seconds}s")
+                _login_in_progress = False
             except Exception as e:
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"Failed: {e}")
                 log.error(f"Phone step error: {e}")
+                _login_in_progress = False
             return
+
         if step == "code":
             code = text.replace(" ", "")
             try:
+                if not user_client.is_connected():
+                    await user_client.connect()
                 await user_client.sign_in(conn["phone"], code, phone_code_hash=conn["phone_code_hash"])
                 connect_state.pop(ADMIN_ID, None)
-                global userbot_connected
                 userbot_connected = True
                 me = await user_client.get_me()
                 log.info(f"✅ Userbot connected as {me.first_name} (@{me.username})")
                 await event.reply(f"✅ Userbot connected as {me.first_name} (@{me.username or 'no username'})")
+                _login_in_progress = False
             except SessionPasswordNeededError:
                 conn["step"] = "password"
                 await event.reply("🔐 2FA enabled. Send password:")
                 log.info("2FA required")
+                # Keep _login_in_progress = True
             except PhoneCodeInvalidError:
+                connect_state.pop(ADMIN_ID, None)
                 await event.reply("Wrong code. Use /connect to restart.")
                 log.warning("Invalid code")
+                _login_in_progress = False
             except Exception as e:
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"Login failed: {e}")
                 log.error(f"Code step error: {e}")
+                _login_in_progress = False
             return
+
         if step == "password":
             try:
+                if not user_client.is_connected():
+                    await user_client.connect()
                 await user_client.sign_in(password=text)
                 connect_state.pop(ADMIN_ID, None)
                 userbot_connected = True
                 me = await user_client.get_me()
                 log.info(f"✅ Userbot connected (2FA) as {me.first_name}")
                 await event.reply(f"✅ Userbot connected (2FA) as {me.first_name}")
+                _login_in_progress = False
             except Exception as e:
                 await event.reply(f"Wrong password: {e}")
                 log.error(f"2FA error: {e}")
+                # Don't pop state, let user retry password
             return
 
+    # If we reach here, no login in progress – handle settings inputs
     state = admin_state.get(ADMIN_ID)
     if state == "awaiting_warning_duration":
         try:
@@ -1017,9 +1043,6 @@ async def group_handler(event):
     me_bot = await bot_client.get_me()
     if sender.id == me_bot.id or sender.id == ADMIN_ID:
         return
-
-    # Userbot is NOT used for moderation deletions, only for target bot later
-    # So we don't check userbot here.
 
     msg_text = event.raw_text or ""
     chat_id = event.chat_id
@@ -1119,7 +1142,7 @@ async def userbot_target_deleter(event):
         except Exception as e:
             log.warning(f"Target bot delete failed: {e}")
 
-# ==================== AUTO-RECONNECTION ====================
+# ==================== AUTO-RECONNECTION (PAUSED DURING LOGIN) ====================
 async def run_bot_with_reconnect():
     while True:
         try:
@@ -1135,23 +1158,27 @@ async def run_bot_with_reconnect():
             await asyncio.sleep(10)
 
 async def run_userbot_with_reconnect():
-    global userbot_connected
+    global userbot_connected, _login_in_progress
     while True:
-        try:
-            await user_client.run_until_disconnected()
-            log.warning("User client disconnected, reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
-            await user_client.connect()
-            if await user_client.is_user_authorized():
-                userbot_connected = True
-                log.info("User client reconnected successfully")
-            else:
+        if not _login_in_progress:
+            try:
+                await user_client.run_until_disconnected()
+                log.warning("User client disconnected, reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
+                if not _login_in_progress:
+                    await user_client.connect()
+                    if await user_client.is_user_authorized():
+                        userbot_connected = True
+                        log.info("User client reconnected successfully")
+                    else:
+                        userbot_connected = False
+                        log.info("User client not authorized, use /connect")
+            except Exception as e:
+                log.error(f"User client fatal error: {e}, retrying in 10 seconds...")
                 userbot_connected = False
-                log.info("User client not authorized, use /connect")
-        except Exception as e:
-            log.error(f"User client fatal error: {e}, retrying in 10 seconds...")
-            userbot_connected = False
-            await asyncio.sleep(10)
+                await asyncio.sleep(10)
+        else:
+            await asyncio.sleep(1)   # wait while login is in progress
 
 # ==================== MAIN ====================
 async def main():
