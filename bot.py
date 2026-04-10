@@ -1,9 +1,9 @@
 """
-Squad 4x Group Manager – Full Working Version
-- /connect, /filter, /silentfilter, /settings, /ask, /status, /cancel
-- Gemini AI with key rotation & error handling
-- Forward deletion with exempt channels
-- Persistent SQLite storage
+Squad 4x Group Manager – Fixed for Railway/Render
+- Gemini with model rotation & auto-switch
+- Loading animation for /ask
+- Proper session & DB path handling
+- Channel post exemption (your channel messages are safe)
 """
 
 import os
@@ -22,7 +22,7 @@ from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError,
-    PasswordHashInvalidError, FloodWaitError, MessageNotModifiedError
+    FloodWaitError, RPCError
 )
 import google.generativeai as genai
 
@@ -92,47 +92,94 @@ if not _raw_keys:
     GEMINI_KEYS = []
 else:
     GEMINI_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
-_current_key_index = 0
+
+# Available models to rotate
+GEMINI_MODELS = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro"
+]
+_current_model_idx = 0
+_current_key_idx = 0
 _gemini_quota_exhausted = False
 
-def get_gemini_model():
+def get_gemini_config():
+    """Returns (api_key, model_name) for current rotation"""
     if not GEMINI_KEYS:
         raise RuntimeError("No Gemini keys configured")
-    genai.configure(api_key=GEMINI_KEYS[_current_key_index])
-    return genai.GenerativeModel("gemini-2.0-flash")
+    key = GEMINI_KEYS[_current_key_idx]
+    model = GEMINI_MODELS[_current_model_idx % len(GEMINI_MODELS)]
+    return key, model
 
-def rotate_key():
-    global _current_key_index, _gemini_quota_exhausted
-    if not GEMINI_KEYS:
-        return False
-    next_idx = (_current_key_index + 1) % len(GEMINI_KEYS)
-    if next_idx == 0 and len(GEMINI_KEYS) == 1:
-        _gemini_quota_exhausted = True
-        return False
-    _current_key_index = next_idx
+def rotate_gemini():
+    """Rotate either key or model when quota exhausted"""
+    global _current_key_idx, _current_model_idx, _gemini_quota_exhausted
+    # Try next model first
+    _current_model_idx += 1
+    if _current_model_idx >= len(GEMINI_MODELS):
+        # All models exhausted for this key, try next key
+        _current_model_idx = 0
+        _current_key_idx = (_current_key_idx + 1) % len(GEMINI_KEYS)
+        if _current_key_idx == 0:
+            _gemini_quota_exhausted = True
+            log.warning("All Gemini keys and models exhausted")
+            return False
     _gemini_quota_exhausted = False
-    log.info("🔄 Switched to Gemini key #%s", _current_key_index+1)
+    log.info(f"🔄 Switched to key #{_current_key_idx+1}, model {GEMINI_MODELS[_current_model_idx]}")
     return True
 
+async def call_gemini_with_rotation(prompt):
+    """Call Gemini with automatic rotation on failure"""
+    global _gemini_quota_exhausted
+    if not GEMINI_KEYS or _gemini_quota_exhausted:
+        return None
+    attempts = 0
+    max_attempts = len(GEMINI_KEYS) * len(GEMINI_MODELS) + 1
+    while attempts < max_attempts:
+        try:
+            key, model_name = get_gemini_config()
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(model_name)
+            response = await asyncio.to_thread(model.generate_content, prompt)
+            return response.text
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err or "model not found" in err.lower():
+                attempts += 1
+                if not rotate_gemini():
+                    return None
+                continue
+            log.warning(f"Gemini error (non-quota): {e}")
+            return None
+    return None
+
 # ==================== SESSION PATH ====================
-def prepare_session_path(raw_path):
+def prepare_session_path(raw_path, default_name):
     if not raw_path:
-        raw_path = "user_instance.session"
+        raw_path = default_name
     path = pathlib.Path(raw_path)
     if path.suffix == ".session":
         path = path.with_suffix("")
     parent = path.parent
     if parent and str(parent) != "." and not parent.exists():
-        parent.mkdir(parents=True, exist_ok=True)
-        log.info("📁 Created session directory: %s", parent)
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            log.info(f"📁 Created session directory: {parent}")
+        except PermissionError:
+            # Fallback to /tmp if cannot write
+            fallback = pathlib.Path(f"/tmp/{path.name}")
+            log.warning(f"Cannot write to {parent}, using {fallback.parent}")
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            return str(fallback)
     return str(path)
 
 # ==================== TELEGRAM CLIENTS ====================
 BOT_SESSION_PATH = get_env_var("BOT_SESSION_PATH", required=False, default="/data/bot_session")
-bot_client = TelegramClient(prepare_session_path(BOT_SESSION_PATH), API_ID, API_HASH)
+bot_client = TelegramClient(prepare_session_path(BOT_SESSION_PATH, "bot_session"), API_ID, API_HASH)
 
-USER_SESSION = prepare_session_path(get_env_var("USER_SESSION_PATH", required=False, default="/data/user_instance.session"))
-user_client = TelegramClient(USER_SESSION, API_ID, API_HASH)
+USER_SESSION_PATH = get_env_var("USER_SESSION_PATH", required=False, default="/data/user_instance.session")
+user_client = TelegramClient(prepare_session_path(USER_SESSION_PATH, "user_instance.session"), API_ID, API_HASH)
 
 # ==================== GLOBAL STATE ====================
 connect_state = {}
@@ -145,7 +192,15 @@ DB_PATH = get_env_var("DB_PATH", required=False, default="/data/bot_data.db")
 _db_lock = threading.Lock()
 
 def _db_conn():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except PermissionError:
+            # Fallback to /tmp
+            global DB_PATH
+            DB_PATH = "/tmp/bot_data.db"
+            log.warning(f"Using fallback DB path: {DB_PATH}")
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -159,11 +214,11 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS silent_words (word TEXT PRIMARY KEY)''')
         conn.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
         defaults = {
-            'private_warning': 'off',      # on/off
-            'warning_duration': '300',     # seconds
-            'temp_ban_duration': '0',      # hours (0 = permanent)
-            'delete_all_forwards': 'on',   # on/off
-            'forward_exempt_channels': '', # comma-separated channel IDs
+            'private_warning': 'off',
+            'warning_duration': '300',
+            'temp_ban_duration': '0',
+            'delete_all_forwards': 'on',
+            'forward_exempt_channels': '',
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?,?)", (k, v))
@@ -376,36 +431,25 @@ RULES: When in doubt → ALLOWED.
 Respond ONLY with valid JSON: {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence"}"""
 
 async def _call_gemini(text):
-    global _gemini_quota_exhausted
-    if not GEMINI_KEYS or _gemini_quota_exhausted:
-        return {"verdict": "ALLOWED", "reason": "Assistant offline"}
+    if not GEMINI_KEYS:
+        return {"verdict": "ALLOWED", "reason": "No keys"}
     prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
-    tried = 0
-    total = len(GEMINI_KEYS)
-    while True:
-        try:
-            model = get_gemini_model()
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            raw = response.text.strip()
-            raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
-            data = json.loads(raw)
-            verdict = str(data.get("verdict", "ALLOWED")).upper()
-            reason = str(data.get("reason", "No reason"))
-            if verdict not in ("ALLOWED","PROHIBITED"):
-                verdict = "ALLOWED"
-            log.info("🤖 Gemini [key#%s] → %s | %s", _current_key_index+1, verdict, reason)
-            return {"verdict": verdict, "reason": reason}
-        except Exception as e:
-            err = str(e)
-            if "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err:
-                tried += 1
-                if not rotate_key():
-                    _gemini_quota_exhausted = True
-                    log.warning("All Gemini keys exhausted")
-                    return {"verdict": "ALLOWED", "reason": "Assistant offline"}
-                continue
-            log.warning("Gemini error: %s", e)
-            return {"verdict": "ALLOWED", "reason": "Gemini error"}
+    response = await call_gemini_with_rotation(prompt)
+    if response is None:
+        return {"verdict": "ALLOWED", "reason": "Gemini offline"}
+    try:
+        raw = response.strip()
+        raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        verdict = str(data.get("verdict", "ALLOWED")).upper()
+        reason = str(data.get("reason", "No reason"))
+        if verdict not in ("ALLOWED","PROHIBITED"):
+            verdict = "ALLOWED"
+        log.info(f"🤖 Gemini → {verdict} | {reason}")
+        return {"verdict": verdict, "reason": reason}
+    except Exception as e:
+        log.warning(f"Gemini parse error: {e}")
+        return {"verdict": "ALLOWED", "reason": "Parse error"}
 
 # ==================== MODERATION HELPERS ====================
 async def delete_msg(chat_id, msg_id):
@@ -603,7 +647,7 @@ async def connect_cmd(event):
     if userbot_connected:
         await event.reply("✅ Userbot already connected.")
         return
-    session_file = USER_SESSION + ".session"
+    session_file = USER_SESSION_PATH + ".session"
     if os.path.exists(session_file):
         await event.reply("🔄 Session found. Reconnecting...")
         try:
@@ -653,18 +697,24 @@ async def ask_cmd(event):
     if not question:
         await event.reply("Example: `/ask What is a broker?`")
         return
-    await event.reply("🤔 Thinking...")
+    # Send loading message
+    loading_msg = await event.reply("🤔 Thinking...")
     try:
         if not GEMINI_KEYS or _gemini_quota_exhausted:
-            await event.reply("Assistant offline. Contact admin.")
+            await loading_msg.edit("❌ Assistant offline. Contact admin.")
             return
-        model = get_gemini_model()
-        response = await asyncio.to_thread(model.generate_content, question)
-        answer = response.text.strip()
+        prompt = f"Answer concisely and professionally:\n{question}"
+        response = await call_gemini_with_rotation(prompt)
+        if response is None:
+            await loading_msg.edit("❌ Gemini service unavailable. Try again later.")
+            return
+        answer = response.strip()
+        # Delete loading message and send answer
+        await loading_msg.delete()
         await event.reply(f"🤖 *Squad 4x Assistant:*\n\n{answer}", parse_mode="md")
     except Exception as e:
         log.error(f"Ask error: {e}")
-        await event.reply("Sorry, I encountered an error while processing your request.")
+        await loading_msg.edit("❌ An error occurred while processing your request.")
 
 @bot_client.on(events.NewMessage(pattern="/status"))
 async def status_cmd(event):
@@ -929,7 +979,7 @@ async def group_handler(event):
 
     # Exempt channel (your channel's own posts are never moderated)
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
-        log.info(f"Exempt channel post ignored")
+        log.info(f"Exempt channel post ignored (sender {sender.id})")
         return
 
     me_bot = await bot_client.get_me()
@@ -946,9 +996,9 @@ async def group_handler(event):
     msg_text = event.raw_text or ""
     chat_id = event.chat_id
 
-    # Forward deletion (if enabled, and not exempt channel already handled)
+    # Forward deletion (if enabled, and not from exempt channel)
     if get_setting('delete_all_forwards') == 'on' and event.message.forward:
-        # Also check forward_exempt_channels
+        # Also check forward_exempt_channels setting
         exempt_str = get_setting('forward_exempt_channels') or ""
         exempt_ids = [int(x.strip()) for x in exempt_str.split(",") if x.strip()]
         forward_from_id = None
@@ -1048,7 +1098,7 @@ async def main():
     log.info(f"Bot started: {(await bot_client.get_me()).username}")
 
     try:
-        os.makedirs(os.path.dirname(USER_SESSION) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(USER_SESSION_PATH) or ".", exist_ok=True)
         await user_client.connect()
         if await user_client.is_user_authorized():
             userbot_connected = True
@@ -1066,7 +1116,7 @@ async def main():
         log.error(f"Cannot access group: {e}")
 
     asyncio.create_task(gemini_queue_worker())
-    log.info(f"Gemini: {len(GEMINI_KEYS)} keys | Gap {GEMINI_CALL_GAP}s")
+    log.info(f"Gemini: {len(GEMINI_KEYS)} keys | Models: {len(GEMINI_MODELS)} | Gap {GEMINI_CALL_GAP}s")
     log.info(f"Exempt channel: {EXEMPT_CHANNEL_ID}")
     if userbot_connected:
         await asyncio.gather(bot_client.run_until_disconnected(), user_client.run_until_disconnected())
