@@ -1,9 +1,8 @@
 """
-Squad 4x Group Manager – Fixed for Railway/Render
-- Gemini with model rotation & auto-switch
-- Loading animation for /ask
-- Proper session & DB path handling
-- Channel post exemption (your channel messages are safe)
+Squad 4x Group Manager – Fully Fixed for Railway/Render
+- Gemini with manual model selection + auto-rotation
+- Detailed logging (target bot, exempt channel, connections)
+- Persistent SQLite, dual clients, forward deletion
 """
 
 import os
@@ -22,12 +21,16 @@ from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError,
-    FloodWaitError, RPCError
+    FloodWaitError
 )
 import google.generativeai as genai
 
 # ==================== LOGGING ====================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 log = logging.getLogger(__name__)
 
 # ==================== ENVIRONMENT VALIDATION ====================
@@ -93,8 +96,8 @@ if not _raw_keys:
 else:
     GEMINI_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 
-# Available models to rotate
-GEMINI_MODELS = [
+# All free-tier models
+ALL_GEMINI_MODELS = [
     "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
@@ -105,19 +108,24 @@ _current_key_idx = 0
 _gemini_quota_exhausted = False
 
 def get_gemini_config():
-    """Returns (api_key, model_name) for current rotation"""
+    """Returns (api_key, model_name) based on current rotation + manual setting"""
     if not GEMINI_KEYS:
         raise RuntimeError("No Gemini keys configured")
+    # Check if manual model is set in DB
+    manual_model = get_setting("gemini_model")
+    if manual_model and manual_model in ALL_GEMINI_MODELS:
+        model = manual_model
+    else:
+        model = ALL_GEMINI_MODELS[_current_model_idx % len(ALL_GEMINI_MODELS)]
     key = GEMINI_KEYS[_current_key_idx]
-    model = GEMINI_MODELS[_current_model_idx % len(GEMINI_MODELS)]
     return key, model
 
 def rotate_gemini():
-    """Rotate either key or model when quota exhausted"""
+    """Rotate key or model when quota exhausted"""
     global _current_key_idx, _current_model_idx, _gemini_quota_exhausted
     # Try next model first
     _current_model_idx += 1
-    if _current_model_idx >= len(GEMINI_MODELS):
+    if _current_model_idx >= len(ALL_GEMINI_MODELS):
         # All models exhausted for this key, try next key
         _current_model_idx = 0
         _current_key_idx = (_current_key_idx + 1) % len(GEMINI_KEYS)
@@ -126,31 +134,34 @@ def rotate_gemini():
             log.warning("All Gemini keys and models exhausted")
             return False
     _gemini_quota_exhausted = False
-    log.info(f"🔄 Switched to key #{_current_key_idx+1}, model {GEMINI_MODELS[_current_model_idx]}")
+    log.info(f"🔄 Switched to key #{_current_key_idx+1}, model {ALL_GEMINI_MODELS[_current_model_idx]}")
     return True
 
 async def call_gemini_with_rotation(prompt):
     """Call Gemini with automatic rotation on failure"""
     global _gemini_quota_exhausted
     if not GEMINI_KEYS or _gemini_quota_exhausted:
+        log.error("Gemini unavailable: no keys or quota exhausted")
         return None
     attempts = 0
-    max_attempts = len(GEMINI_KEYS) * len(GEMINI_MODELS) + 1
+    max_attempts = len(GEMINI_KEYS) * len(ALL_GEMINI_MODELS) + 1
     while attempts < max_attempts:
         try:
             key, model_name = get_gemini_config()
             genai.configure(api_key=key)
             model = genai.GenerativeModel(model_name)
+            log.info(f"🤖 Calling Gemini: key #{_current_key_idx+1}, model {model_name}")
             response = await asyncio.to_thread(model.generate_content, prompt)
             return response.text
         except Exception as e:
             err = str(e)
+            log.error(f"Gemini call failed (attempt {attempts+1}): {err}")
             if "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err or "model not found" in err.lower():
                 attempts += 1
                 if not rotate_gemini():
                     return None
                 continue
-            log.warning(f"Gemini error (non-quota): {e}")
+            # Non‑quota error – treat as permanent failure for this request
             return None
     return None
 
@@ -167,7 +178,6 @@ def prepare_session_path(raw_path, default_name):
             parent.mkdir(parents=True, exist_ok=True)
             log.info(f"📁 Created session directory: {parent}")
         except PermissionError:
-            # Fallback to /tmp if cannot write
             fallback = pathlib.Path(f"/tmp/{path.name}")
             log.warning(f"Cannot write to {parent}, using {fallback.parent}")
             fallback.parent.mkdir(parents=True, exist_ok=True)
@@ -192,13 +202,12 @@ DB_PATH = get_env_var("DB_PATH", required=False, default="/data/bot_data.db")
 _db_lock = threading.Lock()
 
 def _db_conn():
-    global DB_PATH  # ✅ FIX: moved to top
+    global DB_PATH  # ✅ Must be first line in function
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         try:
             os.makedirs(db_dir, exist_ok=True)
         except PermissionError:
-            # Fallback to /tmp
             DB_PATH = "/tmp/bot_data.db"
             log.warning(f"Using fallback DB path: {DB_PATH}")
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -219,6 +228,7 @@ def init_db():
             'temp_ban_duration': '0',
             'delete_all_forwards': 'on',
             'forward_exempt_channels': '',
+            'gemini_model': '',  # empty = auto-rotate
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?,?)", (k, v))
@@ -383,6 +393,7 @@ async def gemini_queue_worker():
             if not future.done():
                 future.set_result(result)
         except Exception as e:
+            log.error(f"Gemini worker error: {e}")
             if not future.done():
                 future.set_exception(e)
         finally:
@@ -456,13 +467,15 @@ async def delete_msg(chat_id, msg_id):
     if userbot_connected:
         try:
             await user_client.delete_messages(chat_id, msg_id)
+            log.info(f"🗑️ Deleted message {msg_id} using userbot")
             return
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Userbot delete failed: {e}")
     try:
         await bot_client.delete_messages(chat_id, msg_id)
-    except Exception:
-        pass
+        log.info(f"🗑️ Deleted message {msg_id} using bot")
+    except Exception as e:
+        log.warning(f"Bot delete failed: {e}")
 
 async def ban_user(chat_id, user_id, hours=0):
     until = None
@@ -474,7 +487,7 @@ async def ban_user(chat_id, user_id, hours=0):
             participant=user_id,
             banned_rights=ChatBannedRights(until_date=until, view_messages=True)
         ))
-        log.info(f"Banned user {user_id}" + (f" for {hours}h" if hours else " permanently"))
+        log.info(f"🔨 Banned user {user_id}" + (f" for {hours}h" if hours else " permanently"))
     except Exception as e:
         log.error(f"Ban failed {user_id}: {e}")
 
@@ -491,7 +504,7 @@ async def send_private_warning(user_id, reason):
 async def send_warning(event, reason, user_id, username, full_name):
     private = get_setting('private_warning') == 'on'
     if private and await send_private_warning(user_id, reason):
-        log.info(f"Private warning to {user_id}")
+        log.info(f"📩 Private warning to {user_id}")
         return
     mention = f"@{username}" if username else f"[{full_name}](tg://user?id={user_id})"
     msg = await bot_client.send_message(event.chat_id,
@@ -502,7 +515,7 @@ async def send_warning(event, reason, user_id, username, full_name):
         await asyncio.sleep(duration)
         await delete_msg(event.chat_id, msg.id)
     asyncio.create_task(delete_later())
-    log.info(f"Group warning to {user_id}")
+    log.info(f"⚠️ Group warning to {user_id}")
 
 async def notify_admin(user_id, username, full_name, text, reason, action):
     try:
@@ -513,6 +526,7 @@ async def notify_admin(user_id, username, full_name, text, reason, action):
             f"**Message:**\n```\n{text[:500]}\n```\n\n**Reason:** {reason}\n"
             f"**Time:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
             parse_mode="md")
+        log.info(f"📨 Admin notified about {user_id}: {action}")
     except Exception as e:
         log.error(f"Admin notify failed: {e}")
 
@@ -526,7 +540,7 @@ def keyword_is_banned(text):
 async def _handle_violation(event, uid, uname, fullname, cid, msg_text, reason, is_bot):
     await delete_msg(cid, event.id)
     if is_bot:
-        log.info(f"Bot message deleted (no warn): {fullname}")
+        log.info(f"🤖 Bot message deleted (no warn): {fullname}")
         return
     prior = get_warning_count(uid)
     if prior == 0:
@@ -589,8 +603,19 @@ def get_main_settings_keyboard():
         [Button.inline("🔨 Ban Settings", b"set_ban")],
         [Button.inline("🔇 Silent Filter", b"set_silent")],
         [Button.inline("📤 Forward Control", b"set_forward")],
+        [Button.inline("🤖 Gemini Settings", b"set_gemini")],
         [Button.inline("❌ Close", b"settings_close")]
     ]
+
+def get_gemini_keyboard():
+    current = get_setting("gemini_model") or "Auto (rotate)"
+    models = ["Auto (rotate)"] + ALL_GEMINI_MODELS
+    buttons = []
+    for m in models:
+        label = f"✅ {m}" if m == current else m
+        buttons.append([Button.inline(label, f"gemini_set_{m}".encode())])
+    buttons.append([Button.inline("🔙 Back", b"settings_back")])
+    return buttons
 
 def get_warning_keyboard():
     private = get_setting('private_warning')
@@ -655,6 +680,7 @@ async def connect_cmd(event):
             if await user_client.is_user_authorized():
                 userbot_connected = True
                 me = await user_client.get_me()
+                log.info(f"✅ Userbot reconnected as {me.first_name} (@{me.username})")
                 await event.reply(f"✅ Userbot reconnected as {me.first_name} (@{me.username or 'no username'})")
                 return
         except Exception as e:
@@ -697,11 +723,10 @@ async def ask_cmd(event):
     if not question:
         await event.reply("Example: `/ask What is a broker?`")
         return
-    # Send loading message
     loading_msg = await event.reply("🤔 Thinking...")
     try:
-        if not GEMINI_KEYS or _gemini_quota_exhausted:
-            await loading_msg.edit("❌ Assistant offline. Contact admin.")
+        if not GEMINI_KEYS:
+            await loading_msg.edit("❌ No Gemini API keys configured.")
             return
         prompt = f"Answer concisely and professionally:\n{question}"
         response = await call_gemini_with_rotation(prompt)
@@ -709,7 +734,6 @@ async def ask_cmd(event):
             await loading_msg.edit("❌ Gemini service unavailable. Try again later.")
             return
         answer = response.strip()
-        # Delete loading message and send answer
         await loading_msg.delete()
         await event.reply(f"🤖 *Squad 4x Assistant:*\n\n{answer}", parse_mode="md")
     except Exception as e:
@@ -720,9 +744,10 @@ async def ask_cmd(event):
 async def status_cmd(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
+    model = get_setting("gemini_model") or "Auto"
     await event.reply(
         f"📊 **Status**\nUserbot: {'✅' if userbot_connected else '❌'}\n"
-        f"Gemini keys: {len(GEMINI_KEYS)} | Queue: {_gemini_queue.qsize()}\n"
+        f"Gemini keys: {len(GEMINI_KEYS)} | Model: {model}\nQueue: {_gemini_queue.qsize()}\n"
         f"Banned words: {len(banned_words)} | Silent: {len(get_silent_words())}\n"
         f"Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID}\n"
         f"Exempt channel: {EXEMPT_CHANNEL_ID}\n"
@@ -812,6 +837,16 @@ async def callback_handler(event):
     if d == "set_forward":
         await event.edit("📤 **Forward Control**", buttons=get_forward_keyboard())
         return
+    if d == "set_gemini":
+        await event.edit("🤖 **Gemini Model**\nSelect a model (Auto = rotate on failure):", buttons=get_gemini_keyboard())
+        return
+    if d.startswith("gemini_set_"):
+        model = d.replace("gemini_set_", "")
+        if model == "Auto (rotate)":
+            model = ""
+        set_setting("gemini_model", model)
+        await event.edit(f"✅ Gemini model set to {model or 'Auto rotation'}.", buttons=get_gemini_keyboard())
+        return
     if d == "toggle_private_warning":
         cur = get_setting('private_warning')
         new = 'off' if cur == 'on' else 'on'
@@ -865,12 +900,15 @@ async def admin_private_handler(event):
                 conn["phone_code_hash"] = result.phone_code_hash
                 conn["step"] = "code"
                 await event.reply("📩 Code sent. Send it with spaces (e.g., 1 2 3 4 5)")
+                log.info(f"📱 Code request sent for {text}")
             except FloodWaitError as e:
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"Flood wait {e.seconds}s")
+                log.warning(f"Flood wait {e.seconds}s")
             except Exception as e:
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"Failed: {e}")
+                log.error(f"Phone step error: {e}")
             return
         if step == "code":
             code = text.replace(" ", "")
@@ -880,15 +918,19 @@ async def admin_private_handler(event):
                 global userbot_connected
                 userbot_connected = True
                 me = await user_client.get_me()
+                log.info(f"✅ Userbot connected as {me.first_name} (@{me.username})")
                 await event.reply(f"✅ Userbot connected as {me.first_name} (@{me.username or 'no username'})")
             except SessionPasswordNeededError:
                 conn["step"] = "password"
                 await event.reply("🔐 2FA enabled. Send password:")
+                log.info("2FA required")
             except PhoneCodeInvalidError:
                 await event.reply("Wrong code. Use /connect to restart.")
+                log.warning("Invalid code")
             except Exception as e:
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply(f"Login failed: {e}")
+                log.error(f"Code step error: {e}")
             return
         if step == "password":
             try:
@@ -896,9 +938,11 @@ async def admin_private_handler(event):
                 connect_state.pop(ADMIN_ID, None)
                 userbot_connected = True
                 me = await user_client.get_me()
+                log.info(f"✅ Userbot connected (2FA) as {me.first_name}")
                 await event.reply(f"✅ Userbot connected (2FA) as {me.first_name}")
             except Exception as e:
                 await event.reply(f"Wrong password: {e}")
+                log.error(f"2FA error: {e}")
             return
 
     # Settings inputs
@@ -979,7 +1023,7 @@ async def group_handler(event):
 
     # Exempt channel (your channel's own posts are never moderated)
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
-        log.info(f"Exempt channel post ignored (sender {sender.id})")
+        log.info(f"🛡️ Exempt channel post ignored (sender {sender.id})")
         return
 
     me_bot = await bot_client.get_me()
@@ -998,7 +1042,6 @@ async def group_handler(event):
 
     # Forward deletion (if enabled, and not from exempt channel)
     if get_setting('delete_all_forwards') == 'on' and event.message.forward:
-        # Also check forward_exempt_channels setting
         exempt_str = get_setting('forward_exempt_channels') or ""
         exempt_ids = [int(x.strip()) for x in exempt_str.split(",") if x.strip()]
         forward_from_id = None
@@ -1008,10 +1051,10 @@ async def group_handler(event):
             else:
                 forward_from_id = event.message.forward.from_id.user_id
         if forward_from_id and forward_from_id in exempt_ids:
-            log.info(f"Forward from exempt channel {forward_from_id} ignored")
+            log.info(f"⏩ Forward from exempt channel {forward_from_id} ignored")
         else:
             await delete_msg(chat_id, event.id)
-            log.info(f"Deleted forward from {sender.id}")
+            log.info(f"⏩ Deleted forward from {sender.id}")
             return
 
     if not msg_text:
@@ -1030,7 +1073,7 @@ async def group_handler(event):
         await delete_msg(chat_id, event.id)
         if not is_bot:
             strikes = increment_silent_violation(uid)
-            log.info(f"Silent '{sw}' from {fullname} strike {strikes}/3")
+            log.info(f"🔇 Silent '{sw}' from {fullname} strike {strikes}/3")
             if strikes >= 3:
                 hours = int(get_setting('temp_ban_duration') or 0)
                 await ban_user(chat_id, uid, hours)
@@ -1038,7 +1081,7 @@ async def group_handler(event):
                                    f"BANNED ({hours}h)" if hours else "PERMANENT BAN")
                 reset_silent_violation(uid)
         else:
-            log.info(f"Bot silent delete: {fullname}")
+            log.info(f"🤖 Bot silent delete: {fullname}")
         return
 
     # Spam
@@ -1095,7 +1138,7 @@ async def main():
     global userbot_connected
     init_db()
     await bot_client.start(bot_token=BOT_TOKEN)
-    log.info(f"Bot started: {(await bot_client.get_me()).username}")
+    log.info(f"🚀 Bot started: {(await bot_client.get_me()).username}")
 
     try:
         os.makedirs(os.path.dirname(USER_SESSION_PATH) or ".", exist_ok=True)
@@ -1103,21 +1146,22 @@ async def main():
         if await user_client.is_user_authorized():
             userbot_connected = True
             me = await user_client.get_me()
-            log.info(f"Userbot loaded: {me.first_name}")
+            log.info(f"👤 Userbot loaded: {me.first_name} (@{me.username})")
         else:
-            log.info("Userbot not logged in. Use /connect")
+            log.info("👤 Userbot not logged in. Use /connect")
     except Exception as e:
         log.warning(f"Userbot init failed: {e}")
 
     try:
         ent = await bot_client.get_entity(GROUP_ID)
-        log.info(f"Monitoring: {ent.title}")
+        log.info(f"📢 Monitoring group: {ent.title} (ID: {GROUP_ID})")
     except Exception as e:
         log.error(f"Cannot access group: {e}")
 
     asyncio.create_task(gemini_queue_worker())
-    log.info(f"Gemini: {len(GEMINI_KEYS)} keys | Models: {len(GEMINI_MODELS)} | Gap {GEMINI_CALL_GAP}s")
-    log.info(f"Exempt channel: {EXEMPT_CHANNEL_ID}")
+    log.info(f"🤖 Gemini: {len(GEMINI_KEYS)} keys | Models: {len(ALL_GEMINI_MODELS)} | Gap {GEMINI_CALL_GAP}s")
+    log.info(f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID}")
+    log.info(f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID}")
     if userbot_connected:
         await asyncio.gather(bot_client.run_until_disconnected(), user_client.run_until_disconnected())
     else:
