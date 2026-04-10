@@ -192,13 +192,13 @@ DB_PATH = get_env_var("DB_PATH", required=False, default="/data/bot_data.db")
 _db_lock = threading.Lock()
 
 def _db_conn():
+    global DB_PATH  # ✅ FIX: moved to top
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         try:
             os.makedirs(db_dir, exist_ok=True)
         except PermissionError:
             # Fallback to /tmp
-            global DB_PATH
             DB_PATH = "/tmp/bot_data.db"
             log.warning(f"Using fallback DB path: {DB_PATH}")
     return sqlite3.connect(DB_PATH, check_same_thread=False)
