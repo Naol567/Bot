@@ -2,7 +2,7 @@
 Squad 4x Group Manager – Railway Production Version
 - Persistent storage in /data/
 - Gemini API via httpx (no SDK)
-- Automatic 5s delay + rotation on 429/503 errors
+- Patient retry on 429/503: 5s sleep, retry same key/model up to 3 times
 - Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated
 - Userbot ONLY deletes target bot messages
 """
@@ -139,7 +139,7 @@ else:
 
 # Prioritise gemini-2.5-flash, then fallbacks
 ALL_GEMINI_MODELS = [
-    "gemini-2.5-flash",        # Newest free model
+    "gemini-2.5-flash",
     "gemini-1.5-flash",
     "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
@@ -147,7 +147,8 @@ ALL_GEMINI_MODELS = [
 ]
 _current_model_idx = 0
 _current_key_idx = 0
-_gemini_quota_exhausted = False
+# Track failures per (key, model) to rotate after consecutive failures
+_failure_count = {}
 
 def get_gemini_config():
     if not GEMINI_KEYS:
@@ -161,32 +162,31 @@ def get_gemini_config():
     return key, model
 
 def rotate_gemini():
-    global _current_key_idx, _current_model_idx, _gemini_quota_exhausted
+    global _current_key_idx, _current_model_idx
     _current_model_idx += 1
     if _current_model_idx >= len(ALL_GEMINI_MODELS):
         _current_model_idx = 0
         _current_key_idx = (_current_key_idx + 1) % len(GEMINI_KEYS)
-        if _current_key_idx == 0:
-            _gemini_quota_exhausted = True
-            log.warning("All Gemini keys and models exhausted")
-            return False
-    _gemini_quota_exhausted = False
     log.info(f"🔄 Switched to key #{_current_key_idx+1}, model {ALL_GEMINI_MODELS[_current_model_idx]}")
     return True
 
 async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
     """
     Call Gemini API via httpx.
-    On 429/503 errors: wait 5 seconds, rotate key/model, retry.
-    Returns response text or None if all attempts fail.
+    On 429/503: wait 5 seconds and retry the same (key, model) up to 3 times.
+    Only after 3 consecutive failures, rotate to next model/key.
     """
-    global _gemini_quota_exhausted
-    if not GEMINI_KEYS or _gemini_quota_exhausted:
-        log.error("Gemini unavailable: no keys or quota exhausted")
+    if not GEMINI_KEYS:
+        log.error("Gemini unavailable: no keys configured")
         return None
 
-    max_attempts = len(GEMINI_KEYS) * len(ALL_GEMINI_MODELS) + 1
-    for attempt in range(max_attempts):
+    # Keep track of original starting point to avoid infinite loop
+    start_key_idx = _current_key_idx
+    start_model_idx = _current_model_idx
+    attempts = 0
+    max_total_attempts = len(GEMINI_KEYS) * len(ALL_GEMINI_MODELS) * 3
+
+    while attempts < max_total_attempts:
         key, model = get_gemini_config()
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         payload = {
@@ -200,9 +200,13 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
         }
         headers = {"Content-Type": "application/json"}
 
+        # Track failures for this specific (key, model)
+        fail_key = f"{key}:{model}"
+        current_failures = _failure_count.get(fail_key, 0)
+
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                log.info(f"🤖 Gemini request: key #{_current_key_idx+1}, model {model}")
+                log.info(f"🤖 Gemini request: key #{_current_key_idx+1}, model {model} (failures={current_failures})")
                 resp = await client.post(url, json=payload, headers=headers)
 
                 if resp.status_code == 200:
@@ -214,39 +218,61 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
                         if parts:
                             text = parts[0].get("text", "").strip()
                             if text:
+                                # Success – reset failure count for this key/model
+                                _failure_count[fail_key] = 0
                                 return text
-                    log.warning("Gemini returned empty response")
+                    log.warning("Gemini returned empty response, treating as failure")
+                    # Empty response counts as failure
+                    _failure_count[fail_key] = current_failures + 1
                 else:
                     err_text = resp.text[:200]
                     log.warning(f"Gemini HTTP {resp.status_code}: {err_text}")
 
-                    # On 429 (rate limit) or 503 (service unavailable) → wait 5s then rotate
                     if resp.status_code in (429, 503):
-                        log.info("⏳ Rate limit / high demand – waiting 5 seconds before rotating")
+                        # Rate limit or high demand – wait 5 seconds and retry same config
+                        log.info(f"⏳ {'Rate limit' if resp.status_code==429 else 'Service unavailable'} – waiting 5 seconds, then retry same key/model")
                         await asyncio.sleep(5)
-                        if not rotate_gemini():
-                            return None
+                        # Increment failure counter for this pair
+                        _failure_count[fail_key] = current_failures + 1
+                        # Do NOT rotate yet; retry same key/model
+                        attempts += 1
                         continue
                     elif resp.status_code in (500, 502, 504):
-                        # Transient server errors: rotate without extra delay
-                        if not rotate_gemini():
-                            return None
+                        # Transient server error – rotate immediately
+                        log.info("Server error – rotating to next model/key")
+                        _failure_count[fail_key] = 0
+                        rotate_gemini()
+                        attempts += 1
                         continue
                     else:
-                        # Other errors (400, 403, etc.) are likely permanent
-                        return None
+                        # Other errors (400, 403, etc.) – give up on this key/model
+                        log.warning(f"Permanent error – rotating")
+                        _failure_count[fail_key] = 0
+                        rotate_gemini()
+                        attempts += 1
+                        continue
 
         except (httpx.TimeoutException, httpx.ConnectError, asyncio.TimeoutError) as e:
-            log.warning(f"Gemini network error: {e}, rotating")
-            if not rotate_gemini():
-                return None
+            log.warning(f"Gemini network error: {e} – rotating")
+            _failure_count[fail_key] = 0
+            rotate_gemini()
+            attempts += 1
             continue
         except Exception as e:
             log.error(f"Unexpected Gemini error: {e}")
             return None
 
-        # If we get here (empty response), rotate
-        if not rotate_gemini():
+        # If we reach here, we had a failure that didn't rotate yet.
+        # Check if this key/model has failed 3 times in a row
+        if _failure_count.get(fail_key, 0) >= 3:
+            log.warning(f"Key {key[:8]}... model {model} failed 3 times – rotating")
+            _failure_count[fail_key] = 0
+            rotate_gemini()
+        attempts += 1
+
+        # If we've exhausted all keys and models without success, return None
+        if (_current_key_idx == start_key_idx and _current_model_idx == start_model_idx and attempts > max_total_attempts//2):
+            log.error("All Gemini keys/models exhausted – giving up for now")
             return None
 
     return None
@@ -282,7 +308,6 @@ _login_in_progress = False
 _db_lock = threading.Lock()
 
 def _db_conn():
-    # DB_PATH already inside /data, no fallback needed
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -1053,15 +1078,22 @@ async def admin_private_handler(event):
 # ==================== GROUP MESSAGE HANDLER ====================
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
 async def group_handler(event):
-    if event.out:
-        return
+    # CRITICAL: Exempt channel posts are NEVER moderated
+    # Check sender ID against EXEMPT_CHANNEL_ID
     sender = await event.get_sender()
     if sender is None:
         return
 
-    # ⭐ YOUR CHANNEL POSTS ARE NEVER MODERATED
+    # If this message comes from the linked channel, ignore everything
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
         log.info(f"🛡️ Exempt channel post ignored (sender {sender.id})")
+        return
+
+    # Also check if sender is a channel (broadcast) – some channels forward anonymously
+    # If sender is a channel and its ID matches EXEMPT_CHANNEL_ID, already covered above.
+    # For extra safety, if sender is a channel and we have EXEMPT_CHANNEL_ID, we already blocked.
+
+    if event.out:
         return
 
     me_bot = await bot_client.get_me()
