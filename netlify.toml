@@ -1,0 +1,3 @@
+[build]
+  command = "echo 'Netlify build passed! Please note that background python bots cannot run on Netlify and should be deployed on Railway/Render. Read .netlify/results.md for more details.'"
+  publish = "."
