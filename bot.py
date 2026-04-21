@@ -1,8 +1,7 @@
 """
 Squad 4x Group Manager – Railway Production Version
-- Persistent storage in /data/
-- Gemini API via httpx (no SDK)
-- Patient retry on 429/503: 5s sleep, retry same key/model up to 3 times
+- Multi‑key Gemini with patient retry on 429/503
+- Auto‑delete bot messages after configurable TTL (default 5 min)
 - Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated
 - Userbot ONLY deletes target bot messages
 """
@@ -129,152 +128,82 @@ def keyword_is_banned(text):
             return w
     return None
 
-# ==================== GEMINI SETUP (httpx only) ====================
+# ==================== GEMINI SETUP (multi‑key, patient retry) ====================
 _raw_keys = get_env_var("GEMINI_API_KEY", required=False, default="")
 if not _raw_keys:
     log.warning("GEMINI_API_KEY not set – Gemini moderation disabled")
     GEMINI_KEYS = []
 else:
     GEMINI_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+    log.info(f"Loaded {len(GEMINI_KEYS)} Gemini API key(s)")
 
-# Prioritise gemini-2.5-flash, then fallbacks
-ALL_GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-1.5-pro"
-]
-_current_model_idx = 0
+GEMINI_MODEL = "gemini-2.5-flash"
 _current_key_idx = 0
-# Track failures per (key, model) to rotate after consecutive failures
-_failure_count = {}
 
-def get_gemini_config():
-    if not GEMINI_KEYS:
-        raise RuntimeError("No Gemini keys configured")
-    manual_model = get_setting("gemini_model")
-    if manual_model and manual_model in ALL_GEMINI_MODELS:
-        model = manual_model
-    else:
-        model = ALL_GEMINI_MODELS[_current_model_idx % len(ALL_GEMINI_MODELS)]
-    key = GEMINI_KEYS[_current_key_idx]
-    return key, model
+def rotate_gemini_key():
+    global _current_key_idx
+    _current_key_idx = (_current_key_idx + 1) % len(GEMINI_KEYS)
+    log.info(f"🔄 Switched to Gemini key #{_current_key_idx+1}")
 
-def rotate_gemini():
-    global _current_key_idx, _current_model_idx
-    _current_model_idx += 1
-    if _current_model_idx >= len(ALL_GEMINI_MODELS):
-        _current_model_idx = 0
-        _current_key_idx = (_current_key_idx + 1) % len(GEMINI_KEYS)
-    log.info(f"🔄 Switched to key #{_current_key_idx+1}, model {ALL_GEMINI_MODELS[_current_model_idx]}")
-    return True
-
-async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
+async def call_gemini(prompt: str, timeout: int = 30, max_retries: int = 3):
     """
-    Call Gemini API via httpx.
-    On 429/503: wait 5 seconds and retry the same (key, model) up to 3 times.
-    Only after 3 consecutive failures, rotate to next model/key.
+    Call Gemini API with multiple keys.
+    On 429/503: wait 5 seconds, rotate to next key, retry (up to max_retries times).
     """
     if not GEMINI_KEYS:
-        log.error("Gemini unavailable: no keys configured")
         return None
 
-    # Keep track of original starting point to avoid infinite loop
-    start_key_idx = _current_key_idx
-    start_model_idx = _current_model_idx
-    attempts = 0
-    max_total_attempts = len(GEMINI_KEYS) * len(ALL_GEMINI_MODELS) * 3
-
-    while attempts < max_total_attempts:
-        key, model = get_gemini_config()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt[:3000]}]}],
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-            ]
-        }
+    for attempt in range(max_retries):
+        key = GEMINI_KEYS[_current_key_idx]
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
         headers = {"Content-Type": "application/json"}
-
-        # Track failures for this specific (key, model)
-        fail_key = f"{key}:{model}"
-        current_failures = _failure_count.get(fail_key, 0)
+        payload = {
+            "contents": [{"parts": [{"text": prompt[:3000]}]}]
+        }
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                log.info(f"🤖 Gemini request: key #{_current_key_idx+1}, model {model} (failures={current_failures})")
+                log.info(f"🤖 Gemini request (attempt {attempt+1}/{max_retries}) with key #{_current_key_idx+1}")
                 resp = await client.post(url, json=payload, headers=headers)
 
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
                     if candidates:
-                        content = candidates[0].get("content", {})
-                        parts = content.get("parts", [])
+                        parts = candidates[0].get("content", {}).get("parts", [])
                         if parts:
                             text = parts[0].get("text", "").strip()
                             if text:
-                                # Success – reset failure count for this key/model
-                                _failure_count[fail_key] = 0
                                 return text
-                    log.warning("Gemini returned empty response, treating as failure")
-                    # Empty response counts as failure
-                    _failure_count[fail_key] = current_failures + 1
+                    log.warning("Gemini returned empty response")
+                    # Treat empty response as failure – rotate and retry
                 else:
                     err_text = resp.text[:200]
                     log.warning(f"Gemini HTTP {resp.status_code}: {err_text}")
 
                     if resp.status_code in (429, 503):
-                        # Rate limit or high demand – wait 5 seconds and retry same config
-                        log.info(f"⏳ {'Rate limit' if resp.status_code==429 else 'Service unavailable'} – waiting 5 seconds, then retry same key/model")
+                        log.info(f"⏳ {'Rate limit' if resp.status_code==429 else 'Service unavailable'} – waiting 5s, then rotating key")
                         await asyncio.sleep(5)
-                        # Increment failure counter for this pair
-                        _failure_count[fail_key] = current_failures + 1
-                        # Do NOT rotate yet; retry same key/model
-                        attempts += 1
-                        continue
-                    elif resp.status_code in (500, 502, 504):
-                        # Transient server error – rotate immediately
-                        log.info("Server error – rotating to next model/key")
-                        _failure_count[fail_key] = 0
-                        rotate_gemini()
-                        attempts += 1
+                        rotate_gemini_key()
                         continue
                     else:
-                        # Other errors (400, 403, etc.) – give up on this key/model
-                        log.warning(f"Permanent error – rotating")
-                        _failure_count[fail_key] = 0
-                        rotate_gemini()
-                        attempts += 1
-                        continue
+                        # Permanent error – give up
+                        return None
 
         except (httpx.TimeoutException, httpx.ConnectError, asyncio.TimeoutError) as e:
-            log.warning(f"Gemini network error: {e} – rotating")
-            _failure_count[fail_key] = 0
-            rotate_gemini()
-            attempts += 1
+            log.warning(f"Gemini network error: {e} – rotating key and retrying after 5s")
+            await asyncio.sleep(5)
+            rotate_gemini_key()
             continue
         except Exception as e:
             log.error(f"Unexpected Gemini error: {e}")
             return None
 
-        # If we reach here, we had a failure that didn't rotate yet.
-        # Check if this key/model has failed 3 times in a row
-        if _failure_count.get(fail_key, 0) >= 3:
-            log.warning(f"Key {key[:8]}... model {model} failed 3 times – rotating")
-            _failure_count[fail_key] = 0
-            rotate_gemini()
-        attempts += 1
+        # If we get here, either empty response or unknown error – rotate and retry
+        rotate_gemini_key()
+        continue
 
-        # If we've exhausted all keys and models without success, return None
-        if (_current_key_idx == start_key_idx and _current_model_idx == start_model_idx and attempts > max_total_attempts//2):
-            log.error("All Gemini keys/models exhausted – giving up for now")
-            return None
-
+    log.error(f"Gemini failed after {max_retries} attempts")
     return None
 
 # ==================== PERSISTENT STORAGE PATHS (Railway /data) ====================
@@ -322,11 +251,12 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
         defaults = {
             'private_warning': 'off',
-            'warning_duration': '120',
+            'warning_duration': '120',        # seconds
+            'bot_message_ttl': '300',         # new: auto-delete bot messages after 5 minutes
             'temp_ban_duration': '0',
             'delete_all_forwards': 'on',
             'forward_exempt_channels': '',
-            'gemini_model': '',
+            'gemini_model': '',               # kept for compatibility
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?,?)", (k, v))
@@ -423,6 +353,24 @@ def message_contains_silent_word(text):
             return w
     return None
 
+# ==================== AUTO‑DELETE BOT MESSAGES ====================
+async def send_and_auto_delete(chat_id, message_text, parse_mode=None, buttons=None):
+    """
+    Send a message to the group and schedule its deletion after bot_message_ttl seconds.
+    """
+    msg = await bot_client.send_message(chat_id, message_text, parse_mode=parse_mode, buttons=buttons)
+    ttl = int(get_setting('bot_message_ttl') or 300)
+    if ttl > 0:
+        async def delete_later():
+            await asyncio.sleep(ttl)
+            try:
+                await msg.delete()
+                log.info(f"🗑️ Auto-deleted bot message {msg.id} after {ttl}s")
+            except:
+                pass
+        asyncio.create_task(delete_later())
+    return msg
+
 # ==================== SPAM DETECTION ====================
 def is_spam(text):
     if not text:
@@ -493,9 +441,9 @@ Respond ONLY with valid JSON: {"verdict": "ALLOWED" or "PROHIBITED", "reason": "
 
 async def _call_gemini(text: str):
     if not GEMINI_KEYS:
-        return {"verdict": "ALLOWED", "reason": "No keys"}
+        return {"verdict": "ALLOWED", "reason": "No API keys"}
     prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
-    response = await call_gemini_with_rotation(prompt)
+    response = await call_gemini(prompt)
     if response is None:
         return {"verdict": "ALLOWED", "reason": "Gemini offline"}
     try:
@@ -598,14 +546,12 @@ async def send_warning(event, reason, user_id, username, full_name):
         log.info(f"📩 Private warning to {user_id}")
         return
     mention = f"@{username}" if username else f"[{full_name}](tg://user?id={user_id})"
-    msg = await bot_client.send_message(event.chat_id,
+    # Use send_and_auto_delete so warning auto-deletes after bot_message_ttl
+    msg = await send_and_auto_delete(
+        event.chat_id,
         f"⚠️ **Warning** — {mention}\n\nThis is your **only warning**. Next violation = ban.\n\n📋 Reason: {reason}",
-        parse_mode="md")
-    duration = int(get_setting('warning_duration') or 120)
-    async def delete_later():
-        await asyncio.sleep(duration)
-        await delete_msg(event.chat_id, msg.id)
-    asyncio.create_task(delete_later())
+        parse_mode="md"
+    )
     log.info(f"⚠️ Group warning to {user_id}")
 
 async def notify_admin(user_id, username, full_name, text, reason, action):
@@ -656,12 +602,13 @@ def get_main_settings_keyboard():
         [Button.inline("🔇 Silent Filter", b"set_silent")],
         [Button.inline("📤 Forward Control", b"set_forward")],
         [Button.inline("🤖 Gemini Settings", b"set_gemini")],
+        [Button.inline("⏱️ Bot Message TTL", b"set_ttl")],
         [Button.inline("❌ Close", b"settings_close")]
     ]
 
 def get_gemini_keyboard():
     current = get_setting("gemini_model") or "Auto (rotate)"
-    models = ["Auto (rotate)"] + ALL_GEMINI_MODELS
+    models = ["Auto (rotate)", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-1.5-pro"]
     buttons = []
     for m in models:
         label = f"✅ {m}" if m == current else m
@@ -693,6 +640,13 @@ def get_forward_keyboard():
     return [
         [Button.inline(f"Delete all forwards: {'✅ ON' if delete_all=='on' else '❌ OFF'}", b"toggle_delete_forwards")],
         [Button.inline(f"Exempt channels: {exempt_display[:20]}", b"set_exempt_channels")],
+        [Button.inline("🔙 Back", b"settings_back")]
+    ]
+
+def get_ttl_keyboard():
+    ttl = int(get_setting('bot_message_ttl') or 300)
+    return [
+        [Button.inline(f"Bot message TTL: {ttl} seconds", b"set_ttl_value")],
         [Button.inline("🔙 Back", b"settings_back")]
     ]
 
@@ -787,13 +741,14 @@ async def ask_cmd(event):
             await loading_msg.edit("❌ No Gemini API keys configured.")
             return
         prompt = f"Answer concisely and professionally:\n{question}"
-        response = await call_gemini_with_rotation(prompt)
+        response = await call_gemini(prompt)
         if response is None:
             await loading_msg.edit("❌ Gemini service unavailable. Try again later.")
             return
         answer = response.strip()
         await loading_msg.delete()
-        await event.reply(f"🤖 *Squad 4x Assistant:*\n\n{answer}", parse_mode="md")
+        # Send answer with auto-delete (since it's in the group)
+        await send_and_auto_delete(event.chat_id, f"🤖 *Squad 4x Assistant:*\n\n{answer}", parse_mode="md")
     except Exception as e:
         log.error(f"Ask error: {e}")
         await loading_msg.edit("❌ An error occurred while processing your request.")
@@ -803,6 +758,7 @@ async def status_cmd(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
     model = get_setting("gemini_model") or "Auto"
+    ttl = get_setting('bot_message_ttl') or '300'
     await event.reply(
         f"📊 **Status**\nUserbot: {'✅' if userbot_connected else '❌'}\n"
         f"Gemini keys: {len(GEMINI_KEYS)} | Model: {model}\nQueue: {_gemini_queue.qsize()}\n"
@@ -810,7 +766,8 @@ async def status_cmd(event):
         f"Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID}\n"
         f"Exempt channel: {EXEMPT_CHANNEL_ID}\n"
         f"Private warning: {get_setting('private_warning')}\n"
-        f"Temp ban: {get_setting('temp_ban_duration')}h"
+        f"Temp ban: {get_setting('temp_ban_duration')}h\n"
+        f"Bot message TTL: {ttl}s"
     )
 
 # ==================== CALLBACK HANDLERS ====================
@@ -894,6 +851,13 @@ async def callback_handler(event):
         return
     if d == "set_gemini":
         await event.edit("🤖 **Gemini Model**\nSelect a model (Auto = rotate on failure):", buttons=get_gemini_keyboard())
+        return
+    if d == "set_ttl":
+        await event.edit("⏱️ **Bot Message TTL**\nMessages sent by the bot in the group will be deleted after this many seconds.", buttons=get_ttl_keyboard())
+        return
+    if d == "set_ttl_value":
+        admin_state[ADMIN_ID] = "awaiting_ttl"
+        await event.edit("Send new TTL in seconds (e.g., 300 for 5 minutes, 0 to disable auto-delete).\nSend /cancel to abort.")
         return
     if d.startswith("gemini_set_"):
         model = d.replace("gemini_set_", "")
@@ -1041,6 +1005,18 @@ async def admin_private_handler(event):
         await event.reply(f"✅ Exempt channels set to: {text}", buttons=[[Button.inline("🔙 Back to Settings", b"settings_back")]])
         admin_state.pop(ADMIN_ID, None)
         return
+    if state == "awaiting_ttl":
+        try:
+            ttl = int(text)
+            if ttl < 0:
+                await event.reply("TTL cannot be negative. Use 0 to disable auto-delete.")
+                return
+            set_setting('bot_message_ttl', str(ttl))
+            await event.reply(f"✅ Bot message TTL set to {ttl} seconds.", buttons=[[Button.inline("🔙 Back to Settings", b"settings_back")]])
+        except:
+            await event.reply("Invalid number.")
+        admin_state.pop(ADMIN_ID, None)
+        return
 
     if state == "awaiting_add":
         word = text.lower()
@@ -1079,19 +1055,14 @@ async def admin_private_handler(event):
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
 async def group_handler(event):
     # CRITICAL: Exempt channel posts are NEVER moderated
-    # Check sender ID against EXEMPT_CHANNEL_ID
     sender = await event.get_sender()
     if sender is None:
         return
 
-    # If this message comes from the linked channel, ignore everything
+    # If this message comes from the linked channel, ignore completely
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
         log.info(f"🛡️ Exempt channel post ignored (sender {sender.id})")
         return
-
-    # Also check if sender is a channel (broadcast) – some channels forward anonymously
-    # If sender is a channel and its ID matches EXEMPT_CHANNEL_ID, already covered above.
-    # For extra safety, if sender is a channel and we have EXEMPT_CHANNEL_ID, we already blocked.
 
     if event.out:
         return
@@ -1242,7 +1213,6 @@ async def main():
     await bot_client.start(bot_token=BOT_TOKEN)
     log.info(f"🚀 Bot started: {(await bot_client.get_me()).username}")
 
-    # Ensure /data exists (already done)
     try:
         await user_client.connect()
         if await user_client.is_user_authorized():
@@ -1261,9 +1231,10 @@ async def main():
         log.error(f"Cannot access group: {e}")
 
     asyncio.create_task(gemini_queue_worker())
-    log.info(f"🤖 Gemini: {len(GEMINI_KEYS)} keys | Models: {ALL_GEMINI_MODELS} | Gap {GEMINI_CALL_GAP}s")
+    log.info(f"🤖 Gemini: {len(GEMINI_KEYS)} key(s) | Model: {GEMINI_MODEL} | Gap {GEMINI_CALL_GAP}s")
     log.info(f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID} (messages from this channel are NEVER deleted)")
     log.info(f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID} (userbot will delete its messages only)")
+    log.info(f"⏱️ Bot messages will auto-delete after {get_setting('bot_message_ttl') or 300}s")
 
     await asyncio.gather(
         run_bot_with_reconnect(),
