@@ -1,11 +1,11 @@
 """
-Squad 4x Group Manager – Fully Fixed Production Version
-- Your channel posts are NEVER deleted (EXEMPT_CHANNEL_ID)
+Squad 4x Group Manager – Production Version (httpx only)
+- Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated or deleted
 - Userbot ONLY deletes target bot messages
 - Bot client handles all moderation (filters, warnings, bans)
-- Gemini with auto key/model rotation + manual model selection
-- Warning messages auto-delete after 2 minutes (120s)
-- Stable login flow – no disconnection during /connect
+- Gemini API via httpx with auto key/model rotation on 429/503/“high demand”
+- Warning messages auto‑delete after 2 minutes (120s)
+- No google-generativeai – pure httpx
 """
 
 import os
@@ -19,6 +19,7 @@ import threading
 from collections import Counter
 from datetime import datetime, timezone
 
+import httpx
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
@@ -26,7 +27,6 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError,
     FloodWaitError
 )
-import google.generativeai as genai
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -91,7 +91,46 @@ SPAM_PHRASES = [
 ]
 _spam_phrase_re = re.compile(r'(?:' + '|'.join(re.escape(p) for p in SPAM_PHRASES) + r')', re.IGNORECASE)
 
-# ==================== GEMINI SETUP ====================
+# ==================== BANNED WORDS (must be defined before function that uses it) ====================
+banned_words = [
+    "dm me for signals","dm for signals","i sell signals","selling signals",
+    "join my vip","join our vip","vip signals","paid signals","premium signals",
+    "signal provider","signal service","buy signals","join my group","join our group",
+    "join my channel","join our channel","subscribe to my channel","click the link",
+    "link in bio","check my bio","use my referral","referral link","use my link",
+    "register with my link","deposit via my link","use my code","promo code","invite link",
+    "guaranteed profit","guaranteed return","100% profit","risk free","risk-free",
+    "no loss","double your money","i will manage your account","managed account",
+    "send me money","send usdt","send btc","invest with me","investment platform",
+    "fund your account","withdraw daily","earn daily","earn money online",
+    "make money online","passive income","financial freedom","account for sale",
+    "selling account","buying account","broker account for sale","ea for sale",
+    "robot for sale","whatsapp me","contact me on whatsapp","dm me","message me",
+    "inbox me","contact for promo","available for hire","hire me","i offer services",
+    "we offer services","you idiot","you are stupid","you are dumb","you fool",
+    "shut up","go to hell","son of a bitch","motherfucker","you loser",
+    "ሲግናል እሸጣለሁ","ሲግናል እልካለሁ","ሲግናል ይግዙ","ሲግናል ይጠቀሙ","ሲግናል ቡድን",
+    "ዲኤም አድርጉ","ዲኤም አድርጉኝ","ለሲግናል ዲኤም","ቪአይፒ ቡድን","ቪአይፒ ይቀላቀሉ","ሲግናል ለማግኘት",
+    "ቡድኑን ይቀላቀሉ","ቻናሉን ይቀላቀሉ","ሊንኩን ይጫኑ","ሊንክ ይጠቀሙ","ሪፈራል ሊንክ",
+    "ሊንኬን ተጠቀሙ","ቻናሌን ተቀላቀሉ","ቡድኔን ተቀላቀሉ","ሊንኩን ተጫኑ",
+    "ትርፍ እናረጋግጣለን","ትርፍ ዋስትና","መቶ ፐርሰንት ትርፍ","ኪሳራ የለም",
+    "ገንዘብ ይላኩ","ዩኤስዲቲ ይላኩ","ቢቲሲ ይላኩ","ሂሳብዎን ያስተዳድሩ",
+    "ሂሳብ ያስተዳድራለሁ","ኢንቨስት ያድርጉ","ኢንቨስትመንት","ትርፍ ያግኙ",
+    "ዕለታዊ ትርፍ","ገንዘብ ያስቀምጡ","ፈጣን ትርፍ","ሀብት ይሁኑ",
+    "አካውንት ይሸጣል","አካውንት እሸጣለሁ","አካውንት ለሽያጭ","ሮቦት ለሽያጭ","ኢኤ ለሽያጭ",
+    "ዋትሳፕ ያግኙኝ","ቴሌግራም ያግኙኝ","ያናግሩኝ","መልዕክት ይላኩልኝ",
+    "ደደብ ነህ","ደደብ ነሽ","ሞኝ ነህ","ሞኝ ነሽ","ዝምበል","ውሻ","አህያ",
+    "ጅል ነህ","ጅል ነሽ","ከንቱ","ጊዜ ሌባ","ፋይዳ የለህም","ፋይዳ የለሽም"
+]
+
+def keyword_is_banned(text):
+    low = text.lower()
+    for w in banned_words:
+        if w.lower() in low:
+            return w
+    return None
+
+# ==================== GEMINI SETUP (httpx only) ====================
 _raw_keys = get_env_var("GEMINI_API_KEY", required=False, default="")
 if not _raw_keys:
     log.warning("GEMINI_API_KEY not set – Gemini moderation disabled")
@@ -137,31 +176,71 @@ def rotate_gemini():
     log.info(f"🔄 Switched to key #{_current_key_idx+1}, model {ALL_GEMINI_MODELS[_current_model_idx]}")
     return True
 
-async def call_gemini_with_rotation(prompt):
-    """Call Gemini with automatic rotation on failure"""
+async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
+    """
+    Call Gemini API via httpx with automatic key/model rotation.
+    Returns raw text response or None if all attempts fail.
+    """
     global _gemini_quota_exhausted
     if not GEMINI_KEYS or _gemini_quota_exhausted:
         log.error("Gemini unavailable: no keys or quota exhausted")
         return None
-    attempts = 0
+
     max_attempts = len(GEMINI_KEYS) * len(ALL_GEMINI_MODELS) + 1
-    while attempts < max_attempts:
+    for attempt in range(max_attempts):
+        key, model = get_gemini_config()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt[:3000]}]}],
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+            ]
+        }
+        headers = {"Content-Type": "application/json"}
+
         try:
-            key, model_name = get_gemini_config()
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel(model_name)
-            log.info(f"🤖 Calling Gemini: key #{_current_key_idx+1}, model {model_name}")
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            return response.text
-        except Exception as e:
-            err = str(e)
-            log.error(f"Gemini call failed (attempt {attempts+1}): {err}")
-            if "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err or "model not found" in err.lower():
-                attempts += 1
-                if not rotate_gemini():
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                log.info(f"🤖 Gemini request: key #{_current_key_idx+1}, model {model}")
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Extract text from response
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        content = candidates[0].get("content", {})
+                        parts = content.get("parts", [])
+                        if parts:
+                            text = parts[0].get("text", "").strip()
+                            if text:
+                                return text
+                    log.warning("Gemini returned empty response")
+                    # Treat as failure, rotate
+                else:
+                    err_text = resp.text[:200]
+                    log.warning(f"Gemini HTTP {resp.status_code}: {err_text}")
+                    # Retry on quota / overload / server errors
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        if not rotate_gemini():
+                            return None
+                        continue
+                    # Other errors (e.g., 400 bad request) are likely permanent – give up
                     return None
-                continue
+        except (httpx.TimeoutException, httpx.ConnectError, asyncio.TimeoutError) as e:
+            log.warning(f"Gemini network error: {e}, rotating")
+            if not rotate_gemini():
+                return None
+            continue
+        except Exception as e:
+            log.error(f"Unexpected Gemini error: {e}")
             return None
+
+        # If we get here, we had a 200 but empty response -> rotate
+        if not rotate_gemini():
+            return None
+
     return None
 
 # ==================== SESSION PATH ====================
@@ -378,26 +457,42 @@ MIN_WORDS_GEMINI = 5
 _gemini_queue = asyncio.Queue()
 _last_gemini_call = 0.0
 
-async def gemini_queue_worker():
-    global _last_gemini_call
-    while True:
-        text, future = await _gemini_queue.get()
-        try:
-            loop = asyncio.get_running_loop()
-            now = loop.time()
-            gap = GEMINI_CALL_GAP - (now - _last_gemini_call)
-            if gap > 0:
-                await asyncio.sleep(gap)
-            result = await _call_gemini(text)
-            _last_gemini_call = loop.time()
-            if not future.done():
-                future.set_result(result)
-        except Exception as e:
-            log.error(f"Gemini worker error: {e}")
-            if not future.done():
-                future.set_exception(e)
-        finally:
-            _gemini_queue.task_done()
+SYSTEM_PROMPT = """You are the AI moderation engine for a professional Forex trading Telegram group.
+Members write in BOTH English AND Amharic. Analyse both equally.
+✅ ALWAYS ALLOW:
+- Forex/crypto: currency pairs, trade ideas, entries, exits, SL/TP
+- Technical/fundamental analysis, broker/platform discussion, risk management
+- Market commentary, economic news, education, friendly chat, P&L sharing
+❌ PROHIBITED:
+1. Paid signal ads or VIP group recruitment
+2. Scams: guaranteed profit, wallet deposit requests, managed accounts
+3. Recruiting to other channels/groups, referral links
+4. Personal insults or hate speech
+5. Completely off-topic spam/advertising
+RULES: When in doubt → ALLOWED.
+Respond ONLY with valid JSON: {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence"}"""
+
+async def _call_gemini(text: str):
+    """Actual Gemini call through the rotation wrapper."""
+    if not GEMINI_KEYS:
+        return {"verdict": "ALLOWED", "reason": "No keys"}
+    prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
+    response = await call_gemini_with_rotation(prompt)
+    if response is None:
+        return {"verdict": "ALLOWED", "reason": "Gemini offline"}
+    try:
+        raw = response.strip()
+        raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        verdict = str(data.get("verdict", "ALLOWED")).upper()
+        reason = str(data.get("reason", "No reason"))
+        if verdict not in ("ALLOWED","PROHIBITED"):
+            verdict = "ALLOWED"
+        log.info(f"🤖 Gemini → {verdict} | {reason}")
+        return {"verdict": verdict, "reason": reason}
+    except Exception as e:
+        log.warning(f"Gemini parse error: {e}")
+        return {"verdict": "ALLOWED", "reason": "Parse error"}
 
 def should_use_gemini(text):
     if not GEMINI_KEYS:
@@ -426,41 +521,26 @@ async def queue_gemini_analysis(text):
         log.warning("Queue error: %s", e)
         return {"verdict": "ALLOWED", "reason": "Error"}
 
-SYSTEM_PROMPT = """You are the AI moderation engine for a professional Forex trading Telegram group.
-Members write in BOTH English AND Amharic. Analyse both equally.
-✅ ALWAYS ALLOW:
-- Forex/crypto: currency pairs, trade ideas, entries, exits, SL/TP
-- Technical/fundamental analysis, broker/platform discussion, risk management
-- Market commentary, economic news, education, friendly chat, P&L sharing
-❌ PROHIBITED:
-1. Paid signal ads or VIP group recruitment
-2. Scams: guaranteed profit, wallet deposit requests, managed accounts
-3. Recruiting to other channels/groups, referral links
-4. Personal insults or hate speech
-5. Completely off-topic spam/advertising
-RULES: When in doubt → ALLOWED.
-Respond ONLY with valid JSON: {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence"}"""
-
-async def _call_gemini(text):
-    if not GEMINI_KEYS:
-        return {"verdict": "ALLOWED", "reason": "No keys"}
-    prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
-    response = await call_gemini_with_rotation(prompt)
-    if response is None:
-        return {"verdict": "ALLOWED", "reason": "Gemini offline"}
-    try:
-        raw = response.strip()
-        raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
-        data = json.loads(raw)
-        verdict = str(data.get("verdict", "ALLOWED")).upper()
-        reason = str(data.get("reason", "No reason"))
-        if verdict not in ("ALLOWED","PROHIBITED"):
-            verdict = "ALLOWED"
-        log.info(f"🤖 Gemini → {verdict} | {reason}")
-        return {"verdict": verdict, "reason": reason}
-    except Exception as e:
-        log.warning(f"Gemini parse error: {e}")
-        return {"verdict": "ALLOWED", "reason": "Parse error"}
+async def gemini_queue_worker():
+    global _last_gemini_call
+    while True:
+        text, future = await _gemini_queue.get()
+        try:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            gap = GEMINI_CALL_GAP - (now - _last_gemini_call)
+            if gap > 0:
+                await asyncio.sleep(gap)
+            result = await _call_gemini(text)
+            _last_gemini_call = loop.time()
+            if not future.done():
+                future.set_result(result)
+        except Exception as e:
+            log.error(f"Gemini worker error: {e}")
+            if not future.done():
+                future.set_exception(e)
+        finally:
+            _gemini_queue.task_done()
 
 # ==================== MODERATION HELPERS (BOT ONLY) ====================
 async def delete_msg(chat_id, msg_id):
@@ -524,13 +604,6 @@ async def notify_admin(user_id, username, full_name, text, reason, action):
     except Exception as e:
         log.error(f"Admin notify failed: {e}")
 
-def keyword_is_banned(text):
-    low = text.lower()
-    for w in banned_words:
-        if w.lower() in low:
-            return w
-    return None
-
 async def _handle_violation(event, uid, uname, fullname, cid, msg_text, reason, is_bot):
     await delete_msg(cid, event.id)
     if is_bot:
@@ -546,38 +619,6 @@ async def _handle_violation(event, uid, uname, fullname, cid, msg_text, reason, 
         await ban_user(cid, uid, hours)
         await notify_admin(uid, uname, fullname, msg_text, reason,
                            f"BANNED ({hours}h)" if hours else "PERMANENT BAN")
-
-# ==================== BANNED WORDS ====================
-banned_words = [
-    "dm me for signals","dm for signals","i sell signals","selling signals",
-    "join my vip","join our vip","vip signals","paid signals","premium signals",
-    "signal provider","signal service","buy signals","join my group","join our group",
-    "join my channel","join our channel","subscribe to my channel","click the link",
-    "link in bio","check my bio","use my referral","referral link","use my link",
-    "register with my link","deposit via my link","use my code","promo code","invite link",
-    "guaranteed profit","guaranteed return","100% profit","risk free","risk-free",
-    "no loss","double your money","i will manage your account","managed account",
-    "send me money","send usdt","send btc","invest with me","investment platform",
-    "fund your account","withdraw daily","earn daily","earn money online",
-    "make money online","passive income","financial freedom","account for sale",
-    "selling account","buying account","broker account for sale","ea for sale",
-    "robot for sale","whatsapp me","contact me on whatsapp","dm me","message me",
-    "inbox me","contact for promo","available for hire","hire me","i offer services",
-    "we offer services","you idiot","you are stupid","you are dumb","you fool",
-    "shut up","go to hell","son of a bitch","motherfucker","you loser",
-    "ሲግናል እሸጣለሁ","ሲግናል እልካለሁ","ሲግናል ይግዙ","ሲግናል ይጠቀሙ","ሲግናል ቡድን",
-    "ዲኤም አድርጉ","ዲኤም አድርጉኝ","ለሲግናል ዲኤም","ቪአይፒ ቡድን","ቪአይፒ ይቀላቀሉ","ሲግናል ለማግኘት",
-    "ቡድኑን ይቀላቀሉ","ቻናሉን ይቀላቀሉ","ሊንኩን ይጫኑ","ሊንክ ይጠቀሙ","ሪፈራል ሊንክ",
-    "ሊንኬን ተጠቀሙ","ቻናሌን ተቀላቀሉ","ቡድኔን ተቀላቀሉ","ሊንኩን ተጫኑ",
-    "ትርፍ እናረጋግጣለን","ትርፍ ዋስትና","መቶ ፐርሰንት ትርፍ","ኪሳራ የለም",
-    "ገንዘብ ይላኩ","ዩኤስዲቲ ይላኩ","ቢቲሲ ይላኩ","ሂሳብዎን ያስተዳድሩ",
-    "ሂሳብ ያስተዳድራለሁ","ኢንቨስት ያድርጉ","ኢንቨስትመንት","ትርፍ ያግኙ",
-    "ዕለታዊ ትርፍ","ገንዘብ ያስቀምጡ","ፈጣን ትርፍ","ሀብት ይሁኑ",
-    "አካውንት ይሸጣል","አካውንት እሸጣለሁ","አካውንት ለሽያጭ","ሮቦት ለሽያጭ","ኢኤ ለሽያጭ",
-    "ዋትሳፕ ያግኙኝ","ቴሌግራም ያግኙኝ","ያናግሩኝ","መልዕክት ይላኩልኝ",
-    "ደደብ ነህ","ደደብ ነሽ","ሞኝ ነህ","ሞኝ ነሽ","ዝምበል","ውሻ","አህያ",
-    "ጅል ነህ","ጅል ነሽ","ከንቱ","ጊዜ ሌባ","ፋይዳ የለህም","ፋይዳ የለሽም"
-]
 
 # ==================== INLINE KEYBOARDS ====================
 def make_filter_keyboard():
@@ -666,7 +707,6 @@ async def connect_cmd(event):
     if userbot_connected:
         await event.reply("✅ Userbot already connected.")
         return
-    # If a login is already in progress, don't start another
     if ADMIN_ID in connect_state:
         await event.reply("⏳ Login already in progress. Use /cancel to abort.")
         return
@@ -890,12 +930,10 @@ async def admin_private_handler(event):
     conn = connect_state.get(ADMIN_ID)
     if conn:
         step = conn.get("step")
-        # Login is in progress – keep reconnection paused
 
         if step == "phone":
             conn["phone"] = text
             try:
-                # Ensure client is connected before sending code
                 if not user_client.is_connected():
                     await user_client.connect()
                 result = await user_client.send_code_request(text)
@@ -931,7 +969,6 @@ async def admin_private_handler(event):
                 conn["step"] = "password"
                 await event.reply("🔐 2FA enabled. Send password:")
                 log.info("2FA required")
-                # Keep _login_in_progress = True
             except PhoneCodeInvalidError:
                 connect_state.pop(ADMIN_ID, None)
                 await event.reply("Wrong code. Use /connect to restart.")
@@ -958,10 +995,9 @@ async def admin_private_handler(event):
             except Exception as e:
                 await event.reply(f"Wrong password: {e}")
                 log.error(f"2FA error: {e}")
-                # Don't pop state, let user retry password
             return
 
-    # If we reach here, no login in progress – handle settings inputs
+    # Settings inputs
     state = admin_state.get(ADMIN_ID)
     if state == "awaiting_warning_duration":
         try:
