@@ -1,11 +1,9 @@
 """
 Squad 4x Group Manager – Production Version (httpx only)
+- Uses gemini-2.5-flash as primary model
 - Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated or deleted
 - Userbot ONLY deletes target bot messages
-- Bot client handles all moderation (filters, warnings, bans)
-- Gemini API via httpx with auto key/model rotation on 429/503/“high demand”
-- Warning messages auto‑delete after 2 minutes (120s)
-- No google-generativeai – pure httpx
+- Gemini API via httpx with auto key/model rotation on 429/503
 """
 
 import os
@@ -91,7 +89,7 @@ SPAM_PHRASES = [
 ]
 _spam_phrase_re = re.compile(r'(?:' + '|'.join(re.escape(p) for p in SPAM_PHRASES) + r')', re.IGNORECASE)
 
-# ==================== BANNED WORDS (must be defined before function that uses it) ====================
+# ==================== BANNED WORDS ====================
 banned_words = [
     "dm me for signals","dm for signals","i sell signals","selling signals",
     "join my vip","join our vip","vip signals","paid signals","premium signals",
@@ -138,9 +136,10 @@ if not _raw_keys:
 else:
     GEMINI_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 
-# All free-tier models (in order of preference)
+# UPDATED: gemini-2.5-flash as primary model
 ALL_GEMINI_MODELS = [
-    "gemini-1.5-flash",      # Most stable free model
+    "gemini-2.5-flash",        # Newest, best free-tier model
+    "gemini-1.5-flash",        # Stable fallback
     "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
     "gemini-1.5-pro"
@@ -177,10 +176,7 @@ def rotate_gemini():
     return True
 
 async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
-    """
-    Call Gemini API via httpx with automatic key/model rotation.
-    Returns raw text response or None if all attempts fail.
-    """
+    """Call Gemini API via httpx with automatic rotation."""
     global _gemini_quota_exhausted
     if not GEMINI_KEYS or _gemini_quota_exhausted:
         log.error("Gemini unavailable: no keys or quota exhausted")
@@ -207,7 +203,6 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
                 resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
-                    # Extract text from response
                     candidates = data.get("candidates", [])
                     if candidates:
                         content = candidates[0].get("content", {})
@@ -217,16 +212,13 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
                             if text:
                                 return text
                     log.warning("Gemini returned empty response")
-                    # Treat as failure, rotate
                 else:
                     err_text = resp.text[:200]
                     log.warning(f"Gemini HTTP {resp.status_code}: {err_text}")
-                    # Retry on quota / overload / server errors
                     if resp.status_code in (429, 500, 502, 503, 504):
                         if not rotate_gemini():
                             return None
                         continue
-                    # Other errors (e.g., 400 bad request) are likely permanent – give up
                     return None
         except (httpx.TimeoutException, httpx.ConnectError, asyncio.TimeoutError) as e:
             log.warning(f"Gemini network error: {e}, rotating")
@@ -237,7 +229,6 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
             log.error(f"Unexpected Gemini error: {e}")
             return None
 
-        # If we get here, we had a 200 but empty response -> rotate
         if not rotate_gemini():
             return None
 
@@ -274,7 +265,7 @@ connect_state = {}
 userbot_connected = False
 admin_state = {}
 silent_admin_state = {}
-_login_in_progress = False   # Prevent reconnection during login
+_login_in_progress = False
 
 # ==================== SQLITE DATABASE ====================
 DB_PATH = get_env_var("DB_PATH", required=False, default="/data/bot_data.db")
@@ -303,7 +294,7 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
         defaults = {
             'private_warning': 'off',
-            'warning_duration': '120',      # 2 minutes default
+            'warning_duration': '120',
             'temp_ban_duration': '0',
             'delete_all_forwards': 'on',
             'forward_exempt_channels': '',
@@ -473,7 +464,6 @@ RULES: When in doubt → ALLOWED.
 Respond ONLY with valid JSON: {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence"}"""
 
 async def _call_gemini(text: str):
-    """Actual Gemini call through the rotation wrapper."""
     if not GEMINI_KEYS:
         return {"verdict": "ALLOWED", "reason": "No keys"}
     prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
@@ -544,7 +534,6 @@ async def gemini_queue_worker():
 
 # ==================== MODERATION HELPERS (BOT ONLY) ====================
 async def delete_msg(chat_id, msg_id):
-    """Delete message using bot only (userbot only deletes target bot)"""
     try:
         await bot_client.delete_messages(chat_id, msg_id)
         log.info(f"🗑️ Deleted message {msg_id} using bot")
@@ -915,7 +904,7 @@ async def callback_handler(event):
         await event.answer("No action", alert=True)
         return
 
-# ==================== ADMIN PRIVATE MESSAGE HANDLER (FIXED LOGIN) ====================
+# ==================== ADMIN PRIVATE MESSAGE HANDLER ====================
 @bot_client.on(events.NewMessage)
 async def admin_private_handler(event):
     global _login_in_progress, userbot_connected
@@ -930,7 +919,6 @@ async def admin_private_handler(event):
     conn = connect_state.get(ADMIN_ID)
     if conn:
         step = conn.get("step")
-
         if step == "phone":
             conn["phone"] = text
             try:
@@ -952,7 +940,6 @@ async def admin_private_handler(event):
                 log.error(f"Phone step error: {e}")
                 _login_in_progress = False
             return
-
         if step == "code":
             code = text.replace(" ", "")
             try:
@@ -980,7 +967,6 @@ async def admin_private_handler(event):
                 log.error(f"Code step error: {e}")
                 _login_in_progress = False
             return
-
         if step == "password":
             try:
                 if not user_client.is_connected():
@@ -997,7 +983,6 @@ async def admin_private_handler(event):
                 log.error(f"2FA error: {e}")
             return
 
-    # Settings inputs
     state = admin_state.get(ADMIN_ID)
     if state == "awaiting_warning_duration":
         try:
@@ -1150,13 +1135,11 @@ async def group_handler(event):
 # ==================== USERBOT ONLY TARGET BOT DELETER ====================
 @user_client.on(events.NewMessage(chats=GROUP_ID))
 async def userbot_target_deleter(event):
-    """Userbot ONLY deletes messages from the target bot. Does nothing else."""
     if not userbot_connected:
         return
     sender = await event.get_sender()
     if sender is None:
         return
-    # Never delete exempt channel messages
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
         return
     try:
@@ -1178,7 +1161,7 @@ async def userbot_target_deleter(event):
         except Exception as e:
             log.warning(f"Target bot delete failed: {e}")
 
-# ==================== AUTO-RECONNECTION (PAUSED DURING LOGIN) ====================
+# ==================== AUTO-RECONNECTION ====================
 async def run_bot_with_reconnect():
     while True:
         try:
@@ -1214,7 +1197,7 @@ async def run_userbot_with_reconnect():
                 userbot_connected = False
                 await asyncio.sleep(10)
         else:
-            await asyncio.sleep(1)   # wait while login is in progress
+            await asyncio.sleep(1)
 
 # ==================== MAIN ====================
 async def main():
@@ -1243,7 +1226,7 @@ async def main():
         log.error(f"Cannot access group: {e}")
 
     asyncio.create_task(gemini_queue_worker())
-    log.info(f"🤖 Gemini: {len(GEMINI_KEYS)} keys | Models: {len(ALL_GEMINI_MODELS)} | Gap {GEMINI_CALL_GAP}s")
+    log.info(f"🤖 Gemini: {len(GEMINI_KEYS)} keys | Models: {ALL_GEMINI_MODELS} | Gap {GEMINI_CALL_GAP}s")
     log.info(f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID} (messages from this channel are NEVER deleted)")
     log.info(f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID} (userbot will delete its messages only)")
 
