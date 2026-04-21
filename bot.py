@@ -1,9 +1,8 @@
 """
-Squad 4x Group Manager – Railway Production Version
-- Multi‑key Gemini with patient retry on 429/503
-- Auto‑delete bot messages after configurable TTL (default 5 min)
-- Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated
-- Userbot ONLY deletes target bot messages
+Squad 4x Group Manager – Layered Moderation
+1. Local filters: silent words, spam (incl. URLs), banned keywords, forward deletion
+2. For surviving messages longer than 10 words → AI (Gemini → Groq) for final verdict
+3. Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated
 """
 
 import os
@@ -56,6 +55,10 @@ TARGET_BOT_USERNAME = get_env_var("TARGET_BOT_USERNAME", required=False, default
 TARGET_BOT_ID = int(get_env_var("TARGET_BOT_ID", required=False, default="0")) if get_env_var("TARGET_BOT_ID", required=False) else None
 EXEMPT_CHANNEL_ID = int(get_env_var("EXEMPT_CHANNEL_ID", required=False, default="0")) if get_env_var("EXEMPT_CHANNEL_ID", required=False) else None
 
+GROQ_API_KEY = get_env_var("GROQ_API_KEY", required=False, default="")
+if not GROQ_API_KEY:
+    log.warning("GROQ_API_KEY not set – Groq fallback disabled")
+
 # ==================== SPAM & FOREX SAFE WORDS ====================
 SPAM_CAPS_RATIO = 0.75
 SPAM_REPEAT_CHARS = 6
@@ -88,6 +91,9 @@ SPAM_PHRASES = [
     "ሲግናል ሸጭ","ቪፒ ቡድን","ነጻ ገንዘብ","ፈጣን ሀብት","ሂሳብ ሽያጭ"
 ]
 _spam_phrase_re = re.compile(r'(?:' + '|'.join(re.escape(p) for p in SPAM_PHRASES) + r')', re.IGNORECASE)
+
+# URL pattern for local deletion (user request: "url no allowed deleted by bot")
+URL_PATTERN = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
 
 # ==================== BANNED WORDS ====================
 banned_words = [
@@ -128,14 +134,14 @@ def keyword_is_banned(text):
             return w
     return None
 
-# ==================== GEMINI SETUP (multi‑key, patient retry) ====================
+# ==================== GEMINI SETUP ====================
 _raw_keys = get_env_var("GEMINI_API_KEY", required=False, default="")
 if not _raw_keys:
-    log.warning("GEMINI_API_KEY not set – Gemini moderation disabled")
+    log.warning("GEMINI_API_KEY not set – Gemini disabled")
     GEMINI_KEYS = []
 else:
     GEMINI_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
-    log.info(f"Loaded {len(GEMINI_KEYS)} Gemini API key(s)")
+    log.info(f"Loaded {len(GEMINI_KEYS)} Gemini key(s)")
 
 GEMINI_MODEL = "gemini-2.5-flash"
 _current_key_idx = 0
@@ -145,27 +151,18 @@ def rotate_gemini_key():
     _current_key_idx = (_current_key_idx + 1) % len(GEMINI_KEYS)
     log.info(f"🔄 Switched to Gemini key #{_current_key_idx+1}")
 
-async def call_gemini(prompt: str, timeout: int = 30, max_retries: int = 3):
-    """
-    Call Gemini API with multiple keys.
-    On 429/503: wait 5 seconds, rotate to next key, retry (up to max_retries times).
-    """
+async def call_gemini(prompt: str, timeout: int = 30, max_retries: int = 2):
     if not GEMINI_KEYS:
         return None
-
     for attempt in range(max_retries):
         key = GEMINI_KEYS[_current_key_idx]
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
         headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{"parts": [{"text": prompt[:3000]}]}]
-        }
-
+        payload = {"contents": [{"parts": [{"text": prompt[:3000]}]}]}
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                log.info(f"🤖 Gemini request (attempt {attempt+1}/{max_retries}) with key #{_current_key_idx+1}")
+                log.info(f"🤖 Gemini request (attempt {attempt+1}/{max_retries}) key #{_current_key_idx+1}")
                 resp = await client.post(url, json=payload, headers=headers)
-
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
@@ -175,38 +172,58 @@ async def call_gemini(prompt: str, timeout: int = 30, max_retries: int = 3):
                             text = parts[0].get("text", "").strip()
                             if text:
                                 return text
-                    log.warning("Gemini returned empty response")
-                    # Treat empty response as failure – rotate and retry
+                    log.warning("Gemini empty response")
                 else:
                     err_text = resp.text[:200]
                     log.warning(f"Gemini HTTP {resp.status_code}: {err_text}")
-
-                    if resp.status_code in (429, 503):
-                        log.info(f"⏳ {'Rate limit' if resp.status_code==429 else 'Service unavailable'} – waiting 5s, then rotating key")
-                        await asyncio.sleep(5)
-                        rotate_gemini_key()
-                        continue
-                    else:
-                        # Permanent error – give up
-                        return None
-
-        except (httpx.TimeoutException, httpx.ConnectError, asyncio.TimeoutError) as e:
-            log.warning(f"Gemini network error: {e} – rotating key and retrying after 5s")
-            await asyncio.sleep(5)
-            rotate_gemini_key()
-            continue
+                    if resp.status_code in (429, 503, 404):
+                        return None  # fallback to Groq
+                    rotate_gemini_key()
+                    continue
         except Exception as e:
-            log.error(f"Unexpected Gemini error: {e}")
+            log.warning(f"Gemini exception: {e}")
             return None
-
-        # If we get here, either empty response or unknown error – rotate and retry
         rotate_gemini_key()
-        continue
-
-    log.error(f"Gemini failed after {max_retries} attempts")
     return None
 
-# ==================== PERSISTENT STORAGE PATHS (Railway /data) ====================
+# ==================== GROQ API ====================
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+async def call_groq(prompt: str, timeout: int = 30):
+    if not GROQ_API_KEY:
+        return None
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt[:4000]}],
+        "temperature": 0.7,
+        "max_tokens": 1024
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            log.info("🔄 Falling back to Groq API")
+            resp = await client.post(GROQ_URL, json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices:
+                    content = choices[0].get("message", {}).get("content", "").strip()
+                    if content:
+                        return content
+            log.warning(f"Groq HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+    except Exception as e:
+        log.error(f"Groq exception: {e}")
+        return None
+
+async def call_ai_with_fallback(prompt: str) -> str | None:
+    response = await call_gemini(prompt)
+    if response:
+        return response
+    return await call_groq(prompt)
+
+# ==================== PERSISTENT STORAGE ====================
 DATA_DIR = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -239,6 +256,13 @@ _db_lock = threading.Lock()
 def _db_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+DEFAULT_SILENT_WORDS = [
+    "giveaway", "ጊቭዋይ", "የታለ", "ሌባ", "scammer", "ቁሻሻ", "ሌቦች", "እናትህን",
+    "ከብት", "free course", "ms", "ስጦታው", "reward", "we are ready", "100$", "ready",
+    "ሽልማቱ", "አጭበርባሪ", "ተበዳ", "የማትረባ", "የምትፈልጉ", "የማትሰጡ", "የጠበቅን ነዉ",
+    "dm me", "inbox me", "inbox", "100"
+]
+
 def init_db():
     with _db_lock:
         conn = _db_conn()
@@ -251,18 +275,20 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
         defaults = {
             'private_warning': 'off',
-            'warning_duration': '120',        # seconds
-            'bot_message_ttl': '300',         # new: auto-delete bot messages after 5 minutes
+            'warning_duration': '120',
+            'bot_message_ttl': '300',
             'temp_ban_duration': '0',
             'delete_all_forwards': 'on',
             'forward_exempt_channels': '',
-            'gemini_model': '',               # kept for compatibility
+            'gemini_model': '',
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?,?)", (k, v))
+        for word in DEFAULT_SILENT_WORDS:
+            conn.execute("INSERT OR IGNORE INTO silent_words (word) VALUES (?)", (word.lower(),))
         conn.commit()
         conn.close()
-    log.info("✅ Database ready")
+    log.info(f"✅ DB ready – {len(DEFAULT_SILENT_WORDS)} default silent words")
 
 def get_setting(key):
     with _db_lock:
@@ -355,9 +381,6 @@ def message_contains_silent_word(text):
 
 # ==================== AUTO‑DELETE BOT MESSAGES ====================
 async def send_and_auto_delete(chat_id, message_text, parse_mode=None, buttons=None):
-    """
-    Send a message to the group and schedule its deletion after bot_message_ttl seconds.
-    """
     msg = await bot_client.send_message(chat_id, message_text, parse_mode=parse_mode, buttons=buttons)
     ttl = int(get_setting('bot_message_ttl') or 300)
     if ttl > 0:
@@ -371,13 +394,18 @@ async def send_and_auto_delete(chat_id, message_text, parse_mode=None, buttons=N
         asyncio.create_task(delete_later())
     return msg
 
-# ==================== SPAM DETECTION ====================
+# ==================== SPAM DETECTION (includes URL) ====================
 def is_spam(text):
     if not text:
         return False, ""
     text_lower = text.lower()
     words = text.split()
     wc = len(words)
+
+    # URL detection – user wants URLs deleted immediately
+    if URL_PATTERN.search(text):
+        return True, "URL not allowed"
+
     if _spam_phrase_re.search(text_lower):
         return True, "Spam phrase"
     lower_words = {w.lower().strip(".,!?()[]") for w in words}
@@ -407,7 +435,7 @@ def is_spam(text):
                 return True, "Random keyboard spam"
     return False, ""
 
-# ==================== SUSPICIOUS PATTERNS (GEMINI TRIGGER) ====================
+# ==================== SUSPICIOUS PATTERNS (for AI trigger) ====================
 SUSPICIOUS_PATTERNS = [
     r"https?://", r"t\.me/", r"bit\.ly", r"wa\.me",
     r"\b(usdt|btc|eth|crypto|wallet|deposit|withdraw)\b",
@@ -418,11 +446,10 @@ SUSPICIOUS_PATTERNS = [
 ]
 _suspicious_re = re.compile("|".join(SUSPICIOUS_PATTERNS), re.IGNORECASE)
 
-# ==================== GEMINI QUEUE ====================
-GEMINI_CALL_GAP = 10
-MIN_WORDS_GEMINI = 5
-_gemini_queue = asyncio.Queue()
-_last_gemini_call = 0.0
+# ==================== AI QUEUE ====================
+AI_CALL_GAP = 10
+_ai_queue = asyncio.Queue()
+_last_ai_call = 0.0
 
 SYSTEM_PROMPT = """You are the AI moderation engine for a professional Forex trading Telegram group.
 Members write in BOTH English AND Amharic. Analyse both equally.
@@ -439,13 +466,11 @@ Members write in BOTH English AND Amharic. Analyse both equally.
 RULES: When in doubt → ALLOWED.
 Respond ONLY with valid JSON: {"verdict": "ALLOWED" or "PROHIBITED", "reason": "one sentence"}"""
 
-async def _call_gemini(text: str):
-    if not GEMINI_KEYS:
-        return {"verdict": "ALLOWED", "reason": "No API keys"}
+async def _call_ai_for_moderation(text: str):
     prompt = f"{SYSTEM_PROMPT}\n\nMessage:\n---\n{text[:2000]}\n---"
-    response = await call_gemini(prompt)
+    response = await call_ai_with_fallback(prompt)
     if response is None:
-        return {"verdict": "ALLOWED", "reason": "Gemini offline"}
+        return {"verdict": "ALLOWED", "reason": "AI offline"}
     try:
         raw = response.strip()
         raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
@@ -454,26 +479,17 @@ async def _call_gemini(text: str):
         reason = str(data.get("reason", "No reason"))
         if verdict not in ("ALLOWED","PROHIBITED"):
             verdict = "ALLOWED"
-        log.info(f"🤖 Gemini → {verdict} | {reason}")
+        log.info(f"🤖 AI → {verdict} | {reason}")
         return {"verdict": verdict, "reason": reason}
     except Exception as e:
-        log.warning(f"Gemini parse error: {e}")
+        log.warning(f"AI parse error: {e}")
         return {"verdict": "ALLOWED", "reason": "Parse error"}
 
-def should_use_gemini(text):
-    if not GEMINI_KEYS:
-        return False
-    if len(text.strip().split()) < MIN_WORDS_GEMINI:
-        return False
-    return bool(_suspicious_re.search(text))
-
-async def queue_gemini_analysis(text):
-    if not should_use_gemini(text):
-        return {"verdict": "ALLOWED", "reason": "Skipped"}
+async def queue_ai_analysis(text):
     loop = asyncio.get_running_loop()
     future = loop.create_future()
-    await _gemini_queue.put((text, future))
-    log.info("📥 Queued for Gemini (size: %s)", _gemini_queue.qsize())
+    await _ai_queue.put((text, future))
+    log.info("📥 Queued for AI (size: %s)", _ai_queue.qsize())
     try:
         shielded = asyncio.shield(future)
         return await asyncio.wait_for(shielded, timeout=300)
@@ -481,40 +497,38 @@ async def queue_gemini_analysis(text):
         if not future.done():
             future.cancel()
         return {"verdict": "ALLOWED", "reason": "Timeout"}
-    except asyncio.CancelledError:
-        return {"verdict": "ALLOWED", "reason": "Cancelled"}
     except Exception as e:
         log.warning("Queue error: %s", e)
         return {"verdict": "ALLOWED", "reason": "Error"}
 
-async def gemini_queue_worker():
-    global _last_gemini_call
+async def ai_queue_worker():
+    global _last_ai_call
     while True:
-        text, future = await _gemini_queue.get()
+        text, future = await _ai_queue.get()
         try:
             loop = asyncio.get_running_loop()
             now = loop.time()
-            gap = GEMINI_CALL_GAP - (now - _last_gemini_call)
+            gap = AI_CALL_GAP - (now - _last_ai_call)
             if gap > 0:
                 await asyncio.sleep(gap)
-            result = await _call_gemini(text)
-            _last_gemini_call = loop.time()
+            result = await _call_ai_for_moderation(text)
+            _last_ai_call = loop.time()
             if not future.done():
                 future.set_result(result)
         except Exception as e:
-            log.error(f"Gemini worker error: {e}")
+            log.error(f"AI worker error: {e}")
             if not future.done():
                 future.set_exception(e)
         finally:
-            _gemini_queue.task_done()
+            _ai_queue.task_done()
 
 # ==================== MODERATION HELPERS ====================
 async def delete_msg(chat_id, msg_id):
     try:
         await bot_client.delete_messages(chat_id, msg_id)
-        log.info(f"🗑️ Deleted message {msg_id} using bot")
+        log.info(f"🗑️ Deleted message {msg_id}")
     except Exception as e:
-        log.warning(f"Bot delete failed: {e}")
+        log.warning(f"Delete failed: {e}")
 
 async def ban_user(chat_id, user_id, hours=0):
     until = None
@@ -546,8 +560,7 @@ async def send_warning(event, reason, user_id, username, full_name):
         log.info(f"📩 Private warning to {user_id}")
         return
     mention = f"@{username}" if username else f"[{full_name}](tg://user?id={user_id})"
-    # Use send_and_auto_delete so warning auto-deletes after bot_message_ttl
-    msg = await send_and_auto_delete(
+    await send_and_auto_delete(
         event.chat_id,
         f"⚠️ **Warning** — {mention}\n\nThis is your **only warning**. Next violation = ban.\n\n📋 Reason: {reason}",
         parse_mode="md"
@@ -583,7 +596,7 @@ async def _handle_violation(event, uid, uname, fullname, cid, msg_text, reason, 
         await notify_admin(uid, uname, fullname, msg_text, reason,
                            f"BANNED ({hours}h)" if hours else "PERMANENT BAN")
 
-# ==================== INLINE KEYBOARDS ====================
+# ==================== INLINE KEYBOARDS (unchanged) ====================
 def make_filter_keyboard():
     return [
         [Button.inline("➕ Add Word", b"filter_add"), Button.inline("➖ Remove Word", b"filter_remove")],
@@ -737,37 +750,31 @@ async def ask_cmd(event):
         return
     loading_msg = await event.reply("🤔 Thinking...")
     try:
-        if not GEMINI_KEYS:
-            await loading_msg.edit("❌ No Gemini API keys configured.")
+        if not GEMINI_KEYS and not GROQ_API_KEY:
+            await loading_msg.edit("❌ No AI API keys configured.")
             return
-        prompt = f"Answer concisely and professionally:\n{question}"
-        response = await call_gemini(prompt)
+        response = await call_ai_with_fallback(f"Answer concisely and professionally:\n{question}")
         if response is None:
-            await loading_msg.edit("❌ Gemini service unavailable. Try again later.")
+            await loading_msg.edit("❌ All AI services unavailable.")
             return
-        answer = response.strip()
         await loading_msg.delete()
-        # Send answer with auto-delete (since it's in the group)
-        await send_and_auto_delete(event.chat_id, f"🤖 *Squad 4x Assistant:*\n\n{answer}", parse_mode="md")
+        await send_and_auto_delete(event.chat_id, f"🤖 *Assistant:*\n\n{response}", parse_mode="md")
     except Exception as e:
         log.error(f"Ask error: {e}")
-        await loading_msg.edit("❌ An error occurred while processing your request.")
+        await loading_msg.edit("❌ Error")
 
 @bot_client.on(events.NewMessage(pattern="/status"))
 async def status_cmd(event):
     if event.sender_id != ADMIN_ID or event.is_group:
         return
-    model = get_setting("gemini_model") or "Auto"
     ttl = get_setting('bot_message_ttl') or '300'
     await event.reply(
         f"📊 **Status**\nUserbot: {'✅' if userbot_connected else '❌'}\n"
-        f"Gemini keys: {len(GEMINI_KEYS)} | Model: {model}\nQueue: {_gemini_queue.qsize()}\n"
-        f"Banned words: {len(banned_words)} | Silent: {len(get_silent_words())}\n"
-        f"Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID}\n"
+        f"Gemini keys: {len(GEMINI_KEYS)} | Groq: {'✅' if GROQ_API_KEY else '❌'}\n"
+        f"Queue: {_ai_queue.qsize()}\n"
+        f"Banned: {len(banned_words)} | Silent: {len(get_silent_words())}\n"
         f"Exempt channel: {EXEMPT_CHANNEL_ID}\n"
-        f"Private warning: {get_setting('private_warning')}\n"
-        f"Temp ban: {get_setting('temp_ban_duration')}h\n"
-        f"Bot message TTL: {ttl}s"
+        f"Bot TTL: {ttl}s"
     )
 
 # ==================== CALLBACK HANDLERS ====================
@@ -1054,14 +1061,13 @@ async def admin_private_handler(event):
 # ==================== GROUP MESSAGE HANDLER ====================
 @bot_client.on(events.NewMessage(chats=GROUP_ID))
 async def group_handler(event):
-    # CRITICAL: Exempt channel posts are NEVER moderated
     sender = await event.get_sender()
     if sender is None:
         return
 
-    # If this message comes from the linked channel, ignore completely
+    # 1. Exempt channel – never moderated
     if EXEMPT_CHANNEL_ID and sender.id == EXEMPT_CHANNEL_ID:
-        log.info(f"🛡️ Exempt channel post ignored (sender {sender.id})")
+        log.info(f"🛡️ Exempt channel post ignored")
         return
 
     if event.out:
@@ -1074,7 +1080,7 @@ async def group_handler(event):
     msg_text = event.raw_text or ""
     chat_id = event.chat_id
 
-    # Forward deletion (if enabled, and not from exempt channel)
+    # 2. Forward deletion (if enabled)
     if get_setting('delete_all_forwards') == 'on' and event.message.forward:
         exempt_str = get_setting('forward_exempt_channels') or ""
         exempt_ids = [int(x.strip()) for x in exempt_str.split(",") if x.strip()]
@@ -1101,7 +1107,8 @@ async def group_handler(event):
 
     log.info(f"📨 [{fullname}]: {msg_text[:80]}")
 
-    # Silent word
+    # ========== LOCAL FILTERS (run first) ==========
+    # 3. Silent words
     sw = message_contains_silent_word(msg_text)
     if sw:
         await delete_msg(chat_id, event.id)
@@ -1118,27 +1125,33 @@ async def group_handler(event):
             log.info(f"🤖 Bot silent delete: {fullname}")
         return
 
-    # Spam
+    # 4. Spam detection (includes URL, caps, repeated chars, etc.)
     spam_flag, spam_reason = is_spam(msg_text)
     if spam_flag:
         await _handle_violation(event, uid, uname, fullname, chat_id, msg_text, f"Spam: {spam_reason}", is_bot)
         return
 
-    # Keyword
+    # 5. Banned keywords
     kw = keyword_is_banned(msg_text)
     if kw:
         await _handle_violation(event, uid, uname, fullname, chat_id, msg_text, f"Banned word: '{kw}'", is_bot)
         return
 
-    # Gemini
-    res = await queue_gemini_analysis(msg_text)
-    if res["verdict"] == "PROHIBITED":
-        await _handle_violation(event, uid, uname, fullname, chat_id, msg_text, res["reason"], is_bot)
-        return
+    # ========== AI MODERATION (only for messages that survived local filters AND are long) ==========
+    # User request: send to AI only if message length > 10 words
+    word_count = len(msg_text.split())
+    if word_count > 10:
+        log.info(f"📏 Long message ({word_count} words) – sending to AI for final check")
+        res = await queue_ai_analysis(msg_text)
+        if res["verdict"] == "PROHIBITED":
+            await _handle_violation(event, uid, uname, fullname, chat_id, msg_text, res["reason"], is_bot)
+            return
+        else:
+            log.info(f"✅ AI allowed long message: {fullname}")
+    else:
+        log.info(f"✅ Short message (≤10 words) passed local filters – allowed without AI")
 
-    log.info(f"✅ Allowed: {fullname}")
-
-# ==================== USERBOT ONLY TARGET BOT DELETER ====================
+# ==================== USERBOT TARGET DELETER ====================
 @user_client.on(events.NewMessage(chats=GROUP_ID))
 async def userbot_target_deleter(event):
     if not userbot_connected:
@@ -1172,14 +1185,14 @@ async def run_bot_with_reconnect():
     while True:
         try:
             await bot_client.run_until_disconnected()
-            log.warning("Bot client disconnected, reconnecting in 5 seconds...")
+            log.warning("Bot client disconnected, reconnecting...")
             await asyncio.sleep(5)
             await bot_client.connect()
             if not await bot_client.is_user_authorized():
                 await bot_client.start(bot_token=BOT_TOKEN)
-            log.info("Bot client reconnected successfully")
+            log.info("Bot reconnected")
         except Exception as e:
-            log.error(f"Bot client fatal error: {e}, retrying in 10 seconds...")
+            log.error(f"Bot fatal: {e}, retrying in 10s")
             await asyncio.sleep(10)
 
 async def run_userbot_with_reconnect():
@@ -1188,18 +1201,14 @@ async def run_userbot_with_reconnect():
         if not _login_in_progress:
             try:
                 await user_client.run_until_disconnected()
-                log.warning("User client disconnected, reconnecting in 5 seconds...")
+                log.warning("User client disconnected")
                 await asyncio.sleep(5)
                 if not _login_in_progress:
                     await user_client.connect()
-                    if await user_client.is_user_authorized():
-                        userbot_connected = True
-                        log.info("User client reconnected successfully")
-                    else:
-                        userbot_connected = False
-                        log.info("User client not authorized, use /connect")
+                    userbot_connected = await user_client.is_user_authorized()
+                    log.info(f"Userbot reconnected: {userbot_connected}")
             except Exception as e:
-                log.error(f"User client fatal error: {e}, retrying in 10 seconds...")
+                log.error(f"Userbot error: {e}")
                 userbot_connected = False
                 await asyncio.sleep(10)
         else:
@@ -1209,37 +1218,32 @@ async def run_userbot_with_reconnect():
 async def main():
     global userbot_connected
     init_db()
-
     await bot_client.start(bot_token=BOT_TOKEN)
     log.info(f"🚀 Bot started: {(await bot_client.get_me()).username}")
 
     try:
         await user_client.connect()
-        if await user_client.is_user_authorized():
-            userbot_connected = True
+        userbot_connected = await user_client.is_user_authorized()
+        if userbot_connected:
             me = await user_client.get_me()
-            log.info(f"👤 Userbot loaded: {me.first_name} (@{me.username})")
+            log.info(f"👤 Userbot: {me.first_name}")
         else:
-            log.info("👤 Userbot not logged in. Use /connect")
+            log.info("Userbot not logged in. Use /connect")
     except Exception as e:
-        log.warning(f"Userbot init failed: {e}")
+        log.warning(f"Userbot init: {e}")
 
     try:
         ent = await bot_client.get_entity(GROUP_ID)
-        log.info(f"📢 Monitoring group: {ent.title} (ID: {GROUP_ID})")
+        log.info(f"📢 Monitoring: {ent.title}")
     except Exception as e:
         log.error(f"Cannot access group: {e}")
 
-    asyncio.create_task(gemini_queue_worker())
-    log.info(f"🤖 Gemini: {len(GEMINI_KEYS)} key(s) | Model: {GEMINI_MODEL} | Gap {GEMINI_CALL_GAP}s")
-    log.info(f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID} (messages from this channel are NEVER deleted)")
-    log.info(f"🎯 Target bot: {TARGET_BOT_USERNAME or TARGET_BOT_ID} (userbot will delete its messages only)")
-    log.info(f"⏱️ Bot messages will auto-delete after {get_setting('bot_message_ttl') or 300}s")
+    asyncio.create_task(ai_queue_worker())
+    log.info(f"🤖 AI: Gemini keys={len(GEMINI_KEYS)}, Groq={'on' if GROQ_API_KEY else 'off'}")
+    log.info(f"🛡️ Exempt channel: {EXEMPT_CHANNEL_ID}")
+    log.info(f"📏 Messages >10 words that survive local filters go to AI for confirmation")
 
-    await asyncio.gather(
-        run_bot_with_reconnect(),
-        run_userbot_with_reconnect()
-    )
+    await asyncio.gather(run_bot_with_reconnect(), run_userbot_with_reconnect())
 
 if __name__ == "__main__":
     asyncio.run(main())
