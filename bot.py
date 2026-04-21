@@ -1,9 +1,10 @@
 """
-Squad 4x Group Manager – Production Version (httpx only)
-- Uses gemini-2.5-flash as primary model
-- Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated or deleted
+Squad 4x Group Manager – Railway Production Version
+- Persistent storage in /data/
+- Gemini API via httpx (no SDK)
+- Automatic 5s delay + rotation on 429/503 errors
+- Channel posts (EXEMPT_CHANNEL_ID) are NEVER moderated
 - Userbot ONLY deletes target bot messages
-- Gemini API via httpx with auto key/model rotation on 429/503
 """
 
 import os
@@ -34,9 +35,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ==================== ENVIRONMENT ====================
+# ==================== ENVIRONMENT VARIABLES ====================
 def get_env_var(name: str, required: bool = True, default=None):
-    value = os.environ.get(name, default)
+    value = os.getenv(name, default)
     if required and value is None:
         log.critical(f"Missing required environment variable: {name}")
         raise ValueError(f"Missing required environment variable: {name}")
@@ -136,10 +137,10 @@ if not _raw_keys:
 else:
     GEMINI_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 
-# UPDATED: gemini-2.5-flash as primary model
+# Prioritise gemini-2.5-flash, then fallbacks
 ALL_GEMINI_MODELS = [
-    "gemini-2.5-flash",        # Newest, best free-tier model
-    "gemini-1.5-flash",        # Stable fallback
+    "gemini-2.5-flash",        # Newest free model
+    "gemini-1.5-flash",
     "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
     "gemini-1.5-pro"
@@ -149,7 +150,6 @@ _current_key_idx = 0
 _gemini_quota_exhausted = False
 
 def get_gemini_config():
-    """Returns (api_key, model_name) based on current rotation + manual setting"""
     if not GEMINI_KEYS:
         raise RuntimeError("No Gemini keys configured")
     manual_model = get_setting("gemini_model")
@@ -161,7 +161,6 @@ def get_gemini_config():
     return key, model
 
 def rotate_gemini():
-    """Rotate key or model when quota exhausted"""
     global _current_key_idx, _current_model_idx, _gemini_quota_exhausted
     _current_model_idx += 1
     if _current_model_idx >= len(ALL_GEMINI_MODELS):
@@ -176,7 +175,11 @@ def rotate_gemini():
     return True
 
 async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
-    """Call Gemini API via httpx with automatic rotation."""
+    """
+    Call Gemini API via httpx.
+    On 429/503 errors: wait 5 seconds, rotate key/model, retry.
+    Returns response text or None if all attempts fail.
+    """
     global _gemini_quota_exhausted
     if not GEMINI_KEYS or _gemini_quota_exhausted:
         log.error("Gemini unavailable: no keys or quota exhausted")
@@ -201,6 +204,7 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
             async with httpx.AsyncClient(timeout=timeout) as client:
                 log.info(f"🤖 Gemini request: key #{_current_key_idx+1}, model {model}")
                 resp = await client.post(url, json=payload, headers=headers)
+
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
@@ -215,11 +219,23 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
                 else:
                     err_text = resp.text[:200]
                     log.warning(f"Gemini HTTP {resp.status_code}: {err_text}")
-                    if resp.status_code in (429, 500, 502, 503, 504):
+
+                    # On 429 (rate limit) or 503 (service unavailable) → wait 5s then rotate
+                    if resp.status_code in (429, 503):
+                        log.info("⏳ Rate limit / high demand – waiting 5 seconds before rotating")
+                        await asyncio.sleep(5)
                         if not rotate_gemini():
                             return None
                         continue
-                    return None
+                    elif resp.status_code in (500, 502, 504):
+                        # Transient server errors: rotate without extra delay
+                        if not rotate_gemini():
+                            return None
+                        continue
+                    else:
+                        # Other errors (400, 403, etc.) are likely permanent
+                        return None
+
         except (httpx.TimeoutException, httpx.ConnectError, asyncio.TimeoutError) as e:
             log.warning(f"Gemini network error: {e}, rotating")
             if not rotate_gemini():
@@ -229,36 +245,31 @@ async def call_gemini_with_rotation(prompt: str, timeout: int = 30):
             log.error(f"Unexpected Gemini error: {e}")
             return None
 
+        # If we get here (empty response), rotate
         if not rotate_gemini():
             return None
 
     return None
 
-# ==================== SESSION PATH ====================
-def prepare_session_path(raw_path, default_name):
-    if not raw_path:
-        raw_path = default_name
-    path = pathlib.Path(raw_path)
-    if path.suffix == ".session":
-        path = path.with_suffix("")
-    parent = path.parent
-    if parent and str(parent) != "." and not parent.exists():
-        try:
-            parent.mkdir(parents=True, exist_ok=True)
-            log.info(f"📁 Created session directory: {parent}")
-        except PermissionError:
-            fallback = pathlib.Path(f"/tmp/{path.name}")
-            log.warning(f"Cannot write to {parent}, using {fallback.parent}")
-            fallback.parent.mkdir(parents=True, exist_ok=True)
-            return str(fallback)
-    return str(path)
+# ==================== PERSISTENT STORAGE PATHS (Railway /data) ====================
+DATA_DIR = "/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+BOT_SESSION_PATH = os.path.join(DATA_DIR, "bot_session")
+USER_SESSION_PATH = os.path.join(DATA_DIR, "user_instance.session")
+DB_PATH = os.path.join(DATA_DIR, "bot_data.db")
+
+def prepare_session_path(path):
+    p = pathlib.Path(path)
+    if p.suffix == ".session":
+        p = p.with_suffix("")
+    parent = p.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    return str(p)
 
 # ==================== TELEGRAM CLIENTS ====================
-BOT_SESSION_PATH = get_env_var("BOT_SESSION_PATH", required=False, default="/data/bot_session")
-bot_client = TelegramClient(prepare_session_path(BOT_SESSION_PATH, "bot_session"), API_ID, API_HASH)
-
-USER_SESSION_PATH = get_env_var("USER_SESSION_PATH", required=False, default="/data/user_instance.session")
-user_client = TelegramClient(prepare_session_path(USER_SESSION_PATH, "user_instance.session"), API_ID, API_HASH)
+bot_client = TelegramClient(prepare_session_path(BOT_SESSION_PATH), API_ID, API_HASH)
+user_client = TelegramClient(prepare_session_path(USER_SESSION_PATH), API_ID, API_HASH)
 
 # ==================== GLOBAL STATE ====================
 connect_state = {}
@@ -268,18 +279,10 @@ silent_admin_state = {}
 _login_in_progress = False
 
 # ==================== SQLITE DATABASE ====================
-DB_PATH = get_env_var("DB_PATH", required=False, default="/data/bot_data.db")
 _db_lock = threading.Lock()
 
 def _db_conn():
-    global DB_PATH
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        try:
-            os.makedirs(db_dir, exist_ok=True)
-        except PermissionError:
-            DB_PATH = "/tmp/bot_data.db"
-            log.warning(f"Using fallback DB path: {DB_PATH}")
+    # DB_PATH already inside /data, no fallback needed
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -532,7 +535,7 @@ async def gemini_queue_worker():
         finally:
             _gemini_queue.task_done()
 
-# ==================== MODERATION HELPERS (BOT ONLY) ====================
+# ==================== MODERATION HELPERS ====================
 async def delete_msg(chat_id, msg_id):
     try:
         await bot_client.delete_messages(chat_id, msg_id)
@@ -1207,8 +1210,8 @@ async def main():
     await bot_client.start(bot_token=BOT_TOKEN)
     log.info(f"🚀 Bot started: {(await bot_client.get_me()).username}")
 
+    # Ensure /data exists (already done)
     try:
-        os.makedirs(os.path.dirname(USER_SESSION_PATH) or ".", exist_ok=True)
         await user_client.connect()
         if await user_client.is_user_authorized():
             userbot_connected = True
